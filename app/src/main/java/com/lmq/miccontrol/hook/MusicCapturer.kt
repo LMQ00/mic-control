@@ -42,14 +42,18 @@ object MusicCapturer {
         log("${lpparam.packageName}：发现 ${writeMethods.size} 个 write 重载，挂载截取")
 
         writeMethods.forEach { method ->
-            // 长度参数的位置必须按方法签名判定，不能想当然认为"最后一个 int 就是长度"：
-            // 例如 write(byte[], int offset, int size, int writeMode) 的最后一个 int
-            // 其实是写入模式（取值 0 或 1），若当成长度，就只会送出 1 个字节。
+            // 长度与偏移的位置都必须按方法签名判定，不能想当然：
+            // - write(byte[], int offset, int size, int writeMode) 的最后一个 int
+            //   其实是写入模式（0 或 1），当成长度的话每次只会送出 1 个字节；
+            // - 同一次调用的第 2 个参数是偏移，表示本轮声音从数组哪里开始，
+            //   忽略它就会截到无关内容（播放器通常复用同一块缓冲区）。
             val lengthIndex = lengthArgIndex(method)
             if (lengthIndex < 0) {
                 log("  跳过不认识的签名：${describe(method)}")
                 return@forEach
             }
+            // 有偏移参数的情形：首个参数是数组（直接缓冲那种没有偏移）
+            val offsetIndex = if (method.parameterTypes.firstOrNull()?.isArray == true) 1 else -1
 
             try {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
@@ -65,7 +69,12 @@ object MusicCapturer {
 
                         val data = param.args.getOrNull(0) ?: return
                         val length = (param.args.getOrNull(lengthIndex) as? Int) ?: return
-                        sendToHub(data, length)
+                        val offset = if (offsetIndex >= 0) {
+                            (param.args.getOrNull(offsetIndex) as? Int) ?: 0
+                        } else {
+                            0
+                        }
+                        sendToHub(data, offset, length)
                     }
                 })
                 log("  hook 成功：${describe(method)}（长度参数在第 ${lengthIndex + 1} 个）")
@@ -99,34 +108,49 @@ object MusicCapturer {
     /**
      * 把不同重载传来的数据统一转成字节流送进通道。
      *
-     * 注意各重载里"长度"的含义不同：数组类型给的是**元素个数**，
-     * 缓冲类型给的是**字节数**。这里都交给 [PcmCodec] 按各自的语义处理，
-     * 避免此处的换算出错导致两端对不上（那种情况听起来就是噪音）。
+     * 两个容易出错的地方都在这里统一处理：
+     *
+     * 1. **偏移量不能忽略**。`write(数组, 偏移, 长度)` 里的偏移表示"本轮声音从数组
+     *    的这个位置开始"。音乐播放器通常复用同一块缓冲区；若固定从数组开头读，
+     *    截到的就是无关内容（多半是上一轮残留或空白），听起来断断续续。
+     * 2. **"长度"的含义随类型而变**：数组给的是元素个数，缓冲给的是字节数。
+     *
+     * @param data 调用方传进来的缓冲区
+     * @param offset 有效数据的起始位置（元素个数或字节数，视类型而定）
+     * @param length 有效数据的长度（同上）
      */
-    private fun sendToHub(data: Any, length: Int) {
+    private fun sendToHub(data: Any, offset: Int, length: Int) {
         if (length <= 0) return
         try {
             when (data) {
                 // 已经是字节流，直接送
                 is ByteArray -> {
-                    val n = minOf(length, data.size)
-                    AudioHub.write(data, 0, n)
+                    val start = offset.coerceIn(0, data.size)
+                    val n = minOf(length, data.size - start)
+                    if (n > 0) AudioHub.write(data, start, n)
                 }
 
-                // 16 位样本：length 是样本个数，编码后字节数是它的两倍
+                // 16 位样本：偏移与长度都是"多少个样本"，编码后字节数翻倍
                 is ShortArray -> {
-                    val bytes = ByteArray(data.size * 2)
-                    val written = PcmCodec.shortsToBytes(data, 0, length, bytes)
+                    val start = offset.coerceIn(0, data.size)
+                    val count = minOf(length, data.size - start)
+                    if (count <= 0) return
+                    val bytes = ByteArray(count * 2)
+                    val written = PcmCodec.shortsToBytes(data, start, count, bytes)
                     if (written > 0) AudioHub.write(bytes, 0, written)
                 }
 
                 // 浮点样本：取值范围 -1..1
                 is FloatArray -> {
-                    val bytes = ByteArray(data.size * 2)
-                    val written = PcmCodec.floatsToBytes(data, 0, length, bytes)
+                    val start = offset.coerceIn(0, data.size)
+                    val count = minOf(length, data.size - start)
+                    if (count <= 0) return
+                    val bytes = ByteArray(count * 2)
+                    val written = PcmCodec.floatsToBytes(data, start, count, bytes)
                     if (written > 0) AudioHub.write(bytes, 0, written)
                 }
 
+                // 直接缓冲没有偏移参数：数据从它当前的位置开始，长度按字节算
                 is java.nio.ByteBuffer -> {
                     val buf = data.duplicate()
                     val n = minOf(length, buf.remaining())
