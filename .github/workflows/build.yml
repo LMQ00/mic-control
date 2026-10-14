@@ -46,8 +46,6 @@ jobs:
           echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "SIGNING_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           echo "签名密钥已还原"
-          # 只打印长度，不打印内容——用于确认变量确实传进来了
-          echo "keyAlias 长度=${#SIGNING_KEY_ALIAS} storePassword 长度=${#SIGNING_STORE_PASSWORD} keyPassword 长度=${#SIGNING_KEY_PASSWORD}"
 
       - name: 赋予 gradlew 执行权限
         run: chmod +x ./gradlew
