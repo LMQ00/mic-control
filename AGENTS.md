@@ -1,0 +1,47 @@
+# AGENTS.md
+
+这个项目做的是一个小工具：打开开关以后，手机把指定音乐软件的声音当成麦克风输入送出去，游戏里的队友就会听见你在放歌，而听不见你身边的环境声。你可能是第一次打开这个仓库，也可能是隔了很久回来接着做，还可能只是想知道改了哪一行会不会把东西弄坏。这份文件就是给你指路的：它不解释原理，只告诉你项目的说明文档分别放在哪里，以及动手改代码之前必须守哪些规矩。读完这一段，去下面的表格里找到你此刻需要的那份文档，再照着工程规矩开工，就够了。
+
+## 项目一句话
+
+一个 Android App + 一个 LSPosed 模块：打开开关后，把指定音乐 App 的声音送进系统麦克风入口，让游戏里的队友听到歌、听不到环境声。
+
+## 文档索引
+
+| 文档 | 回答什么问题 |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | 声音从哪来、经过什么、最后到哪去 |
+| [docs/tech-stack.md](docs/tech-stack.md) | 用了什么技术、什么版本、跑在什么环境上 |
+| [docs/development.md](docs/development.md) | 怎么构建、怎么装到手机、签名怎么处理 |
+| [docs/testing.md](docs/testing.md) | 怎么验证这个东西真的成功了 |
+| [docs/security.md](docs/security.md) | root 权限用在哪、会不会偷听、有什么风险 |
+| [docs/runbook.md](docs/runbook.md) | 装完不管用、游戏里听不到声音时先查什么 |
+
+## 文档规则（本节自举：这四条同样约束 AGENTS.md 自己）
+
+1. **索引必须同步**：`docs/` 下每份文件都必须出现在上面的索引表里；新增文档要登记，删除文档要摘除。
+   - enforcement：提交前对照 `docs/` 目录实际内容检查索引表，多一条或少一条都算不合格。
+2. **文档与实现必须一致**：代码行为变了，对应文档必须同步改；发现文档描述和实际不符，按 bug 处理。
+   - enforcement：每次提交后自问「这次改动让哪份文档过时了」；没有答案才算通过。
+3. **写之前先评估必要性**：新增一类文档前先确认本项目确实有内容可写，不为凑数建空文档。
+   - enforcement：每份文档必须有实质内容；无法用「它回答什么问题」一句话说清的，不建。
+4. **写法要求**：首段是外行读得懂的白话导读；决策只记结论、不写被否决的方案和理由；能不出代码就不出代码，要给代码必须跟着可复现的步骤。
+   - enforcement：随机抽一份文档读首段，外行读不懂即为不合格。
+
+## 工程规矩
+
+1. **编译只在 GitHub Actions 跑，本地不装 Android SDK、不本地编译。**
+   - enforcement：本地目录不出现 `local.properties` 中的 SDK 路径、不出现 Gradle 构建产物。
+2. **每完成一个功能里程碑提交一次**，提交信息用中文描述加前缀 `feat` / `fix` / `chore`（例：`feat: 支持从应用列表选择音乐 App`）。
+   - enforcement：`git log --oneline` 中每条提交信息都带这三种前缀之一。
+3. **临时文件一律放 `./tmp`**，该目录必须被 `.gitignore` 忽略。
+   - enforcement：`git status` 不出现 `tmp/` 下的任何文件。
+4. **签名密钥只走 CI 加密变量，密钥文件永不入库。**
+   - enforcement：仓库中搜不到 `.jks` / `.keystore` 文件；`git log` 中搜不到密钥内容。
+5. **公开仓库是 `mic-control`**，用本机已登录的 `gh`（账号 LMQ00）操作。
+   - enforcement：`gh repo view` 能正确显示该仓库。
+
+## 当前状态
+
+- 文档已落盘；代码尚未开始。
+- 下一步：`git init` + 建远程仓库 + 跑通第一个里程碑（技术验证），细节见 [docs/development.md](docs/development.md) 与 [docs/testing.md](docs/testing.md)。

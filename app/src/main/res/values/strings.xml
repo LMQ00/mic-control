@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">麦克风控制</string>
+    <string name="xposed_description">把指定音乐软件的声音作为麦克风输入送出去，让游戏里的队友听到歌而不是环境声。</string>
+</resources>

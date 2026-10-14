@@ -1,0 +1,25 @@
+# 构建产物
+build/
+*.apk
+*.aab
+.gradle/
+
+# 本地开发工具配置（本项目不本地编译，这些文件不应出现）
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 签名密钥：绝不入库
+*.jks
+*.keystore
+keystore.properties
+
+# 临时文件目录
+tmp/
+
+# 系统文件
+.DS_Store
+Thumbs.db
