@@ -36,6 +36,14 @@ object AudioHub {
     /** 发送线程每次从本地缓冲取数据的等待上限。 */
     private const val SEND_POLL_TIMEOUT_MS = 100L
 
+    /**
+     * 多久没收到声音，就认为对面没在出声。
+     *
+     * 取值比人耳能察觉的间隔短得多：既能及时判断"现在没声音、不用等"，
+     * 又不会被声音之间正常的细微间隙误判。
+     */
+    private const val IDLE_THRESHOLD_MS = 200L
+
     private val lock = Object()
 
     @Volatile
@@ -43,6 +51,10 @@ object AudioHub {
 
     @Volatile
     private var workerStarted = false
+
+    /** 最近一次收到声音的时刻，用于判断对面是否正在出声。 */
+    @Volatile
+    private var lastIncomingAt = 0L
 
     /** 待发送的声音：生产者放进来，发送线程取走。 */
     private val outgoing = AudioStream(128 * 1024)
@@ -67,13 +79,35 @@ object AudioHub {
     /**
      * 取一段声音（游戏侧调用）。
      *
-     * 只从本地缓冲取，最多等待 [timeoutMs] 毫秒。
+     * 这里刻意做成"绝大部分情况立刻返回"，因为它是被目标应用的录音线程调用的：
+     * 录音读取通常每十来毫秒就来一次，任何多余的等待都会直接拖慢对方的语音，
+     * 听起来就是卡顿。
+     *
+     * 具体策略：
+     * - 缓冲里有现成数据 → 立刻取走；
+     * - 缓冲是空的，且对面并没有在出声（比如歌还没开始放）→ 立刻返回 0，
+     *   一点也不等。这是最常见的情形，绝不能在这里耗时间；
+     * - 缓冲是空的，但对面正在出声 → 才值得稍等一下，把数据补齐。
      *
      * @return 实际读到的字节数；0 表示暂时没有数据，调用方应保持原样
      */
     fun read(destination: ByteArray, length: Int, timeoutMs: Long): Int {
         if (length <= 0) return 0
         ensureWorker()
+
+        // 先看有没有现成的，不等
+        val immediate = incoming.read(destination, length, 0)
+        if (immediate > 0) return immediate
+
+        // 缓冲空：只有确认对面正在出声，等待才有意义
+        val shouldWait = shouldWaitForData(
+            connected = connected,
+            lastIncomingAt = lastIncomingAt,
+            now = System.currentTimeMillis(),
+            idleThresholdMs = IDLE_THRESHOLD_MS,
+        )
+        if (!shouldWait) return 0
+
         return incoming.read(destination, length, timeoutMs)
     }
 
@@ -191,7 +225,11 @@ object AudioHub {
                 while (true) {
                     val n = input.read(buf)
                     if (n < 0) break
-                    if (n > 0) incoming.write(buf, 0, n)
+                    if (n > 0) {
+                        // 记下收到声音的时刻，供读取侧判断"对面是否正在出声"
+                        lastIncomingAt = System.currentTimeMillis()
+                        incoming.write(buf, 0, n)
+                    }
                 }
             } catch (t: Throwable) {
                 // 断开属正常情况
@@ -209,4 +247,31 @@ object AudioHub {
             Thread.currentThread().interrupt()
         }
     }
+}
+
+/**
+ * 判断缓冲没数据时，是否值得再等一会儿。
+ *
+ * 抽成独立函数是为了能用测试覆盖各种组合。这段判断直接关系到目标应用的录音
+ * 会不会被无谓拖慢——而"开着开关但还没开始放歌"恰是最常见的起始状态，
+ * 一旦在这里等下去，游戏语音就会明显变卡。
+ *
+ * @param connected 通道是否已接通
+ * @param lastIncomingAt 最近一次收到声音的时刻（0 表示从未收到）
+ * @param now 当前时刻
+ * @param idleThresholdMs 超过多久没收到声音就认为对面没在出声
+ * @return 是否应该继续等待数据
+ */
+fun shouldWaitForData(
+    connected: Boolean,
+    lastIncomingAt: Long,
+    now: Long,
+    idleThresholdMs: Long,
+): Boolean {
+    // 通道没连上，等也等不到东西
+    if (!connected) return false
+    // 从来没收到过声音，说明对面还没开始出声
+    if (lastIncomingAt <= 0L) return false
+    // 距上次收到声音已过去太久，判定为当前没在出声
+    return now - lastIncomingAt <= idleThresholdMs
 }
