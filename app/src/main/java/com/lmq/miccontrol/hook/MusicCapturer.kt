@@ -20,51 +20,52 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 object MusicCapturer {
 
     /**
-     * 尝试对当前进程做声音截取。
+     * 在当前进程挂载声音截取。
+     *
+     * 注意：这里**不**判断"当前应用是不是被选中的音乐软件"，那个判断留到每次
+     * 真正播放声音时再做（见下方）。原因是应用启动后钩子就固定了，而你在界面上
+     * 的选择随时可能变——在这里判断会导致改了选择却不生效。
      *
      * @param lpparam 当前加载的应用信息
-     * @param selectedPackage 用户在界面上选中的音乐应用包名
      */
-    fun install(lpparam: XC_LoadPackage.LoadPackageParam, selectedPackage: String?) {
-        // 只处理被选中的那个应用。没选、或不是它，都不做任何事。
-        if (selectedPackage.isNullOrBlank()) {
-            log("尚未指定音乐应用，跳过声音截取")
-            return
-        }
-        if (lpparam.packageName != selectedPackage) return
-
+    fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         val clazz = XposedHelpers.findClassIfExists(
             "android.media.AudioTrack",
             lpparam.classLoader
-        ) ?: run {
-            log("找不到 AudioTrack 类")
-            return
-        }
+        ) ?: return
 
         // AudioTrack.write 有多个重载（byte[]/short[]/float[]/ByteBuffer 等）
         val writeMethods = clazz.declaredMethods.filter { it.name == "write" }
-        if (writeMethods.isEmpty()) {
-            log("AudioTrack 上没有 write 方法")
-            return
-        }
+        if (writeMethods.isEmpty()) return
 
-        log("正在截取 ${lpparam.packageName} 的声音，发现 ${writeMethods.size} 个 write 重载")
+        log("${lpparam.packageName}：发现 ${writeMethods.size} 个 write 重载，挂载截取")
 
         writeMethods.forEach { method ->
+            // 长度参数的位置必须按方法签名判定，不能想当然认为"最后一个 int 就是长度"：
+            // 例如 write(byte[], int offset, int size, int writeMode) 的最后一个 int
+            // 其实是写入模式（取值 0 或 1），若当成长度，就只会送出 1 个字节。
+            val lengthIndex = lengthArgIndex(method)
+            if (lengthIndex < 0) {
+                log("  跳过不认识的签名：${describe(method)}")
+                return@forEach
+            }
+
             try {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: XC_MethodHook.MethodHookParam) {
-                        // 开关关闭时立刻停止截取，音乐照常播放
+                        // 两个运行时判断，缺一不可：
+                        // 1. 总开关必须打开；
+                        // 2. 当前进程必须正是被选中的那个音乐应用——这样你在界面上改了选择，
+                        //    不用重启任何应用就能换一个应用来截取。
                         if (!SwitchState.isEnabled()) return
+                        if (SettingsReader.readMusicPackage() != lpparam.packageName) return
 
-                        val data = param.args.firstOrNull() ?: return
-                        // write 的有效长度参数位置随重载而不同：
-                        // write(byte[], int offset, int length) 与 write(byte[], int, int, int) 等
-                        val length = extractLength(param.args) ?: return
+                        val data = param.args.getOrNull(0) ?: return
+                        val length = (param.args.getOrNull(lengthIndex) as? Int) ?: return
                         sendToHub(data, length)
                     }
                 })
-                log("  hook 成功：${describe(method)}")
+                log("  hook 成功：${describe(method)}（长度参数在第 ${lengthIndex + 1} 个）")
             } catch (t: Throwable) {
                 log("  hook 失败：${describe(method)} -> ${t.message}")
             }
@@ -72,17 +73,24 @@ object MusicCapturer {
     }
 
     /**
-     * 从参数里找出"要写入多少个"这个值。
+     * 判断"要写入多少个"是第几个参数（从 0 开始）。
      *
-     * 不同重载的签名不一样，共同点是：最后一个 int 参数就是有效长度。
-     * 单独抽出来是为了避免依赖具体的参数下标。
+     * 系统里 write 的重载只有两类形态：
+     * - `write(数组, 偏移, 长度[, 写入模式])`——长度是第 3 个参数（下标 2）
+     * - `write(直接缓冲, 长度[, 写入模式])`——长度是第 2 个参数（下标 1）
+     *
+     * 靠第一个参数的类型区分这两类，而不是靠数第几个 int。
+     *
+     * @return 参数下标；签名不认识时返回 -1
      */
-    private fun extractLength(args: Array<Any?>): Int? {
-        for (i in args.indices.reversed()) {
-            val v = args[i]
-            if (v is Int) return v
+    private fun lengthArgIndex(method: java.lang.reflect.Method): Int {
+        val types = method.parameterTypes
+        val first = types.firstOrNull() ?: return -1
+        return when {
+            java.nio.ByteBuffer::class.java.isAssignableFrom(first) -> 1
+            first.isArray -> 2
+            else -> -1
         }
-        return null
     }
 
     /** 把不同重载传来的数据统一转成字节流送进通道。 */

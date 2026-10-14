@@ -28,18 +28,19 @@ class AudioStream(private val size: Int) {
      * 写入一段数据。
      *
      * @param data 源数据
-     * @param length 有效长度（可能小于 data 的长度）
+     * @param offset 从源数据的第几个字节开始
+     * @param length 有效长度
      */
-    fun write(data: ByteArray, length: Int) {
+    fun write(data: ByteArray, offset: Int = 0, length: Int = data.size - offset) {
         if (length <= 0) return
         synchronized(lock) {
-            var offset = 0
-            while (offset < length) {
+            var writtenBytes = 0
+            while (writtenBytes < length) {
                 // 环形写入：写到末尾就绕回开头
-                val index = ((written + offset) % size).toInt()
-                val chunk = minOf(size - index, length - offset)
-                System.arraycopy(data, offset, buffer, index, chunk)
-                offset += chunk
+                val index = ((written + writtenBytes) % size).toInt()
+                val chunk = minOf(size - index, length - writtenBytes)
+                System.arraycopy(data, offset + writtenBytes, buffer, index, chunk)
+                writtenBytes += chunk
             }
             written += length
 

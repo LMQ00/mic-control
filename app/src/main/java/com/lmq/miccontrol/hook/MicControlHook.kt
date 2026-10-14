@@ -11,12 +11,16 @@ import com.lmq.miccontrol.hub.AudioHub
 /**
  * 模块入口。LSPosed 把本模块加载进目标应用进程后会调用 handleLoadPackage。
  *
- * 同一个模块文件承担两种角色，靠"当前是哪个应用"区分：
- * - 是你选中的那个音乐软件 → 截取它播放的声音，送进声音通道；
- * - 是其它应用（比如游戏）→ 拦截它读取麦克风的地方，把通道里的声音交给它。
+ * 同一个模块承担两种角色，具体扮演哪个在**运行时**判定：
+ * - 当这个应用是你选中的音乐软件时 → 截取它播放的声音，送进声音通道；
+ * - 当这个应用是别的应用（比如游戏）时 → 拦截它读取麦克风的地方，把音乐交给它。
  *
- * 注意：两个角色的实际动作都写在方法调用的当时去判断开关，
- * 而不是在加载时就定死。这样你在界面上开关一次，不需要重启游戏就能生效。
+ * ## 为什么一律在运行时判断
+ *
+ * 应用一旦启动，挂上的钩子就固定了，之后没法追加。如果在加载时按"此刻选中的
+ * 音乐软件是谁"来决定挂哪个钩子，那么你之后在界面上改了选择，已经启动的应用
+ * 会一直沿用旧角色——要么截错了应用，要么根本不截。所以两个钩子都挂上，
+ * 每次都重新看一遍开关和当前选择，这样"改了立刻生效"才成立。
  */
 class MicControlHook : IXposedHookLoadPackage {
 
@@ -24,19 +28,10 @@ class MicControlHook : IXposedHookLoadPackage {
         // 自己的界面进程不处理
         if (lpparam.packageName == OWN_PACKAGE) return
 
-        // 这里就挂上 hook。至于要不要真的替换，等实际发生录音/播放时再查开关，
-        // 这样开关的作用是即时的，不受"应用是什么时候启动的"影响。
-        val selected = SettingsReader.readMusicPackage()
+        log("${lpparam.packageName} 已挂载，角色在运行时判定")
 
-        if (!selected.isNullOrBlank() && lpparam.packageName == selected) {
-            log("${lpparam.packageName} 是选定的音乐应用，挂载声音截取")
-            MusicCapturer.install(lpparam, selected)
-        } else if (!selected.isNullOrBlank()) {
-            log("${lpparam.packageName} 是目标应用，挂载录音替换")
-            installMicReplacement(lpparam)
-        } else {
-            log("尚未指定音乐应用，${lpparam.packageName} 不做处理")
-        }
+        MusicCapturer.install(lpparam)
+        installMicReplacement(lpparam)
     }
 
     /**
@@ -49,31 +44,33 @@ class MicControlHook : IXposedHookLoadPackage {
         val clazz = XposedHelpers.findClassIfExists(
             "android.media.AudioRecord",
             lpparam.classLoader
-        ) ?: run {
-            log("找不到 AudioRecord 类")
-            return
-        }
+        ) ?: return
 
         val readMethods = clazz.declaredMethods.filter { it.name == "read" }
-        if (readMethods.isEmpty()) {
-            log("AudioRecord 上没有 read 方法")
-            return
-        }
+        if (readMethods.isEmpty()) return
 
-        log("发现 ${readMethods.size} 个 read 重载")
+        log("${lpparam.packageName}：发现 ${readMethods.size} 个 read 重载，挂载替换")
 
         readMethods.forEach { method ->
+            val lengthIndex = lengthArgIndex(method)
+            if (lengthIndex < 0) return@forEach
+
             try {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: XC_MethodHook.MethodHookParam) {
-                        // 每次录音都实时查开关：关掉开关立刻恢复真实麦克风，无需重启应用
+                        // 运行时判断，缺一不可：
+                        // 1. 总开关必须打开；
+                        // 2. 当前应用不能是被选中的音乐软件——音乐软件自己也可能录音，
+                        //    它是声音来源方，不该被替换。
                         if (!SwitchState.isEnabled()) return
+                        if (SettingsReader.readMusicPackage() == lpparam.packageName) return
 
                         val readCount = (param.result as? Int) ?: return
                         if (readCount <= 0) return
 
-                        val buffer = param.args.firstOrNull() ?: return
-                        fillFromHub(buffer, readCount)
+                        val buffer = param.args.getOrNull(0) ?: return
+                        val offset = (param.args.getOrNull(1) as? Int) ?: 0
+                        fillFromHub(buffer, offset, readCount)
                     }
                 })
                 log("  hook 成功：${describe(method)}")
@@ -84,23 +81,57 @@ class MicControlHook : IXposedHookLoadPackage {
     }
 
     /**
-     * 从声音通道取数据填进调用方的缓冲区。
+     * 判断"要读/写多少个"是第几个参数。
+     *
+     * 系统里 read 和 write 的重载只有两类形态：
+     * - `(数组, 偏移, 长度[, 模式])`——长度是第 3 个参数（下标 2）
+     * - `(直接缓冲, 长度[, 模式])`——长度是第 2 个参数（下标 1）
+     *
+     * 必须按签名判断，不能想当然取"最后一个整数"：例如
+     * `write(byte[], int, int, int writeMode)` 的最后一个整数是写入模式（0 或 1），
+     * 当成长度的话每次就只送出 1 个字节。
+     *
+     * @return 参数下标；签名不认识时返回 -1
+     */
+    private fun lengthArgIndex(method: java.lang.reflect.Method): Int {
+        val types = method.parameterTypes
+        val first = types.firstOrNull() ?: return -1
+        return when {
+            java.nio.ByteBuffer::class.java.isAssignableFrom(first) -> 1
+            first.isArray -> 2
+            else -> -1
+        }
+    }
+
+    /**
+     * 从声音通道取数据，填进调用方提供的缓冲区。
+     *
+     * @param buffer 调用方的缓冲区，可能是数组或直接缓冲
+     * @param offset 数据应写入缓冲区的起始位置（调用方可能只用缓冲区的一部分）
+     * @param count 要填多少个（字节数组是字节数，样本数组是样本数）
      *
      * 通道里暂时没有数据时（比如音乐还没开始放），保留原有内容不动，
      * 让目标应用继续按原样工作，而不是让录音失败——这样即使这套机制没起作用，
      * 游戏语音也还是能正常用。
      */
-    private fun fillFromHub(buffer: Any, count: Int) {
+    private fun fillFromHub(buffer: Any, offset: Int, count: Int) {
         try {
             when (buffer) {
                 is ByteArray -> {
-                    val n = minOf(count, buffer.size)
-                    // 返回 0 表示暂时没有数据，此时不动缓冲区
-                    AudioHub.read(buffer, n, READ_TIMEOUT_MS)
+                    if (offset < 0 || offset >= buffer.size) return
+                    val n = minOf(count, buffer.size - offset)
+                    if (n <= 0) return
+                    // 取数组的一段视图，让数据直接落到正确位置
+                    val view = buffer.copyOfRange(offset, offset + n)
+                    val got = AudioHub.read(view, n, READ_TIMEOUT_MS)
+                    if (got <= 0) return
+                    System.arraycopy(view, 0, buffer, offset, got)
                 }
 
                 is ShortArray -> {
-                    val n = minOf(count, buffer.size)
+                    if (offset < 0 || offset >= buffer.size) return
+                    val n = minOf(count, buffer.size - offset)
+                    if (n <= 0) return
                     val bytes = ByteArray(n * 2)
                     val got = AudioHub.read(bytes, bytes.size, READ_TIMEOUT_MS)
                     if (got <= 0) return
@@ -108,12 +139,14 @@ class MicControlHook : IXposedHookLoadPackage {
                     for (i in 0 until samples) {
                         val lo = bytes[i * 2].toInt() and 0xFF
                         val hi = bytes[i * 2 + 1].toInt()
-                        buffer[i] = ((hi shl 8) or lo).toShort()
+                        buffer[offset + i] = ((hi shl 8) or lo).toShort()
                     }
                 }
 
                 is FloatArray -> {
-                    val n = minOf(count, buffer.size)
+                    if (offset < 0 || offset >= buffer.size) return
+                    val n = minOf(count, buffer.size - offset)
+                    if (n <= 0) return
                     val bytes = ByteArray(n * 2)
                     val got = AudioHub.read(bytes, bytes.size, READ_TIMEOUT_MS)
                     if (got <= 0) return
@@ -122,12 +155,14 @@ class MicControlHook : IXposedHookLoadPackage {
                         val lo = bytes[i * 2].toInt() and 0xFF
                         val hi = bytes[i * 2 + 1].toInt()
                         val s = ((hi shl 8) or lo).toShort()
-                        buffer[i] = s.toFloat() / Short.MAX_VALUE
+                        buffer[offset + i] = s.toFloat() / Short.MAX_VALUE
                     }
                 }
 
                 is java.nio.ByteBuffer -> {
+                    // 直接缓冲不能越界写：只写到它剩余的可写空间为止
                     val n = minOf(count, buffer.remaining())
+                    if (n <= 0) return
                     val bytes = ByteArray(n)
                     val got = AudioHub.read(bytes, n, READ_TIMEOUT_MS)
                     if (got <= 0) return
