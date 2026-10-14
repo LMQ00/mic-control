@@ -4,18 +4,20 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-// 签名信息从环境变量读取（CI 里由加密变量注入）。
-// 本地不编译，所以这里不做任何回退到本地文件的处理，避免密钥意外入库。
+// 签名信息从环境变量读取（CI 里由加密变量注入）。密钥文件不入库。
 //
-// 没配置正式密钥时，退回用 debug 签名。注意：debug 密钥默认是每次构建环境
-// 临时生成的，会导致每次构建出来的包签名都不同、无法覆盖安装。CI 里通过
-// 缓存一个固定的 debug 密钥来避免这个问题，见 .github/workflows/build.yml。
-val keystorePath: String? = System.getenv("SIGNING_KEYSTORE_PATH")
-val keystorePassword: String? = System.getenv("SIGNING_STORE_PASSWORD")
-val keyAlias: String? = System.getenv("SIGNING_KEY_ALIAS")
-val keyPassword: String? = System.getenv("SIGNING_KEY_PASSWORD")
-val hasSigningConfig = !keystorePath.isNullOrBlank() && !keystorePassword.isNullOrBlank() &&
-    !keyAlias.isNullOrBlank() && !keyPassword.isNullOrBlank()
+// 变量名刻意加 signing 前缀：签名配置块内的属性与之同名，若直接叫
+// storePassword / keyAlias / keyPassword，块内引用会解析到配置自身的属性，
+// 变成"把自己赋给自己"，值实际为空。加前缀从根上避免这种冲突。
+val signingKeystorePath: String? = System.getenv("SIGNING_KEYSTORE_PATH")
+val signingStorePassword: String? = System.getenv("SIGNING_STORE_PASSWORD")
+val signingKeyAlias: String? = System.getenv("SIGNING_KEY_ALIAS")
+val signingKeyPassword: String? = System.getenv("SIGNING_KEY_PASSWORD")
+
+val hasSigningConfig = !signingKeystorePath.isNullOrBlank() &&
+    !signingStorePassword.isNullOrBlank() &&
+    !signingKeyAlias.isNullOrBlank() &&
+    !signingKeyPassword.isNullOrBlank()
 
 android {
     namespace = "com.lmq.miccontrol"
@@ -32,12 +34,10 @@ android {
     if (hasSigningConfig) {
         signingConfigs {
             create("release") {
-                // 刻意都用 this. 限定：配置项的属性名和外层变量同名，
-                // 不加限定会变成"把配置项赋给自己"，导致读到空值。
-                storeFile = file(keystorePath!!)
-                this.storePassword = keystorePassword
-                this.keyAlias = keyAlias
-                this.keyPassword = keyPassword
+                storeFile = file(signingKeystorePath!!)
+                storePassword = signingStorePassword
+                keyAlias = signingKeyAlias
+                keyPassword = signingKeyPassword
             }
         }
     }
