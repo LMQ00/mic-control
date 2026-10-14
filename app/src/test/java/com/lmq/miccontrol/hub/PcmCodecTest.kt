@@ -84,9 +84,9 @@ class PcmCodecTest {
         val restored = FloatArray(original.size)
         PcmCodec.bytesToFloats(bytes, bytes.size, restored, 0)
 
-        assertEquals(1f, restored[0], 0.001)
-        assertEquals(-1f, restored[1], 0.001)
-        assertEquals(1f, restored[2], 0.001)
+        assertEquals(1.toDouble(), restored[0].toDouble(), 0.001)
+        assertEquals(-1.toDouble(), restored[1].toDouble(), 0.001)
+        assertEquals(1.toDouble(), restored[2].toDouble(), 0.001)
     }
 
     @Test
