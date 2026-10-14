@@ -67,12 +67,16 @@ class MicControlHook : IXposedHookLoadPackage {
                         log("已替换一次录音数据：${method.name}，长度 $readCount")
                     }
                 })
-                log("  hook 成功：${method.toShortString()}")
+                log("  hook 成功：${describe(method)}")
             } catch (t: Throwable) {
-                log("  hook 失败：${method.toShortString()} -> ${t.message}")
+                log("  hook 失败：${describe(method)} -> ${t.message}")
             }
         }
     }
+
+    /** 生成便于阅读的方法签名，用于日志。 */
+    private fun describe(method: java.lang.reflect.Method): String =
+        "${method.name}(${method.parameterTypes.joinToString(", ") { it.simpleName }})"
 
     private fun log(msg: String) {
         XposedBridge.log("[$TAG] $msg")
