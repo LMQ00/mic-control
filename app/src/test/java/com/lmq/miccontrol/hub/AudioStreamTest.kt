@@ -99,21 +99,42 @@ class AudioStreamTest {
     }
 
     @Test
-    fun `消费者落后太多时会跳到较新的位置`() {
+    fun `消费者只要还有数据就能读到不会无故被跳过`() {
         val size = 32
         val stream = AudioStream(size)
 
         // 先写满
         stream.write(ByteArray(size) { it.toByte() })
-        // 再写超过缓冲区一半的量，触发"落后太多就跳到新位置"的逻辑
+        // 再写满一轮，此时缓冲区里应保留最新的一整轮
         stream.write(ByteArray(size) { (100 + it).toByte() })
 
-        val output = ByteArray(size)
-        val got = stream.read(output, size, timeoutMs = 0)
+        // 连续小段读取，模拟消费者正常消费
+        val collected = ArrayList<Byte>()
+        val chunk = ByteArray(8)
+        repeat(4) {
+            val got = stream.read(chunk, chunk.size, timeoutMs = 0)
+            for (i in 0 until got) collected.add(chunk[i])
+        }
 
-        assertTrue("应该能读到数据", got > 0)
-        // 读到的应当是较新的内容，而不是第一轮的
-        assertTrue("不应读到第一轮的数据", output[got - 1].toInt() != (size - 1))
+        // 应当恰好读满 32 字节，且全部来自第二轮写入
+        assertEquals(size, collected.size)
+        val expected = ByteArray(size) { (100 + it).toByte() }
+        assertArrayEquals(expected, collected.toByteArray())
+    }
+
+    @Test
+    fun `单次请求超过缓冲区容量时读到容量上限而不是永远读不满`() {
+        val size = 16
+        val stream = AudioStream(size)
+
+        // 请求长度是容量的两倍
+        stream.write(ByteArray(size) { it.toByte() })
+
+        val output = ByteArray(size * 2)
+        val got = stream.read(output, size * 2, timeoutMs = 0)
+
+        // 能读到已有的全部数据，而不是因为请求过大就返回 0
+        assertEquals(size, got)
     }
 
     @Test
