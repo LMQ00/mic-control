@@ -92,4 +92,9 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
+
+    // 单元测试：用于验证音频缓冲这类纯逻辑。这些测试在开发机上就能跑，
+    // 不需要设备，所以 CI 每次构建都会顺带验证一遍。
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.2.20")
 }

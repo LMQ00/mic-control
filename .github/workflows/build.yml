@@ -50,6 +50,11 @@ jobs:
       - name: 赋予 gradlew 执行权限
         run: chmod +x ./gradlew
 
+      # 先跑单元测试。音频缓冲这块逻辑一旦出错，现象是"队友听到噪音"
+      # 或"放歌卡住"，现场很难查，所以在构建前先用测试把关。
+      - name: 运行单元测试
+        run: ./gradlew testReleaseUnitTest --stacktrace
+
       - name: 构建
         run: ./gradlew assembleRelease --stacktrace
 
@@ -59,3 +64,12 @@ jobs:
           name: mic-control-apk
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+
+      # 测试失败时把报告一并传上来，方便看是哪一条没过
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
