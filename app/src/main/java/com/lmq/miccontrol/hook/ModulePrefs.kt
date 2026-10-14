@@ -31,6 +31,14 @@ object ModulePrefs {
     private const val KEY_ENABLED = "enabled"
     private const val KEY_MUSIC_PACKAGE = "music_package"
 
+    /**
+     * 多久去确认一次设置有没有改动。
+     *
+     * 250 毫秒意味着：你在界面上关掉开关，正在进行的录音最迟四分之一秒后就
+     * 恢复真实麦克风。人感觉不到这点延迟，而音频路径上的开销降到了很低。
+     */
+    private const val RECHECK_INTERVAL_MS = 250L
+
     private var prefs: XSharedPreferences? = null
 
     /**
@@ -100,15 +108,5 @@ object ModulePrefs {
         } catch (t: Throwable) {
             // 重新加载失败不致命，继续用上一次的值
         }
-    }
-
-    companion object {
-        /**
-         * 多久去确认一次设置有没有改动。
-         *
-         * 250 毫秒意味着：你在界面上关掉开关，正在进行的录音最迟四分之一秒后
-         * 就恢复真实麦克风。人感觉不到这个延迟，但对音频路径的开销降到了很低。
-         */
-        private const val RECHECK_INTERVAL_MS = 250L
     }
 }
