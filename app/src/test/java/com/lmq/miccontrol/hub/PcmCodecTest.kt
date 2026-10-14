@@ -183,4 +183,88 @@ class PcmCodecTest {
         assertArrayEquals(original, restored)
         assertTrue("应写满整个缓冲区", written == original.size * 2)
     }
+
+    // ===== 直接缓冲的覆盖写入 =====
+    // 这一段对应录音接口里最容易出错的分支：读取会把缓冲的位置往后推，
+    // 所以替换数据时必须先退回起点，否则数据会落在错误的偏移上。
+
+    @Test
+    fun `覆盖直接缓冲中刚读入的那一段`() {
+        // 模拟"读入 4 个字节后"的状态：位置已被推进到 4
+        val buffer = java.nio.ByteBuffer.allocate(10)
+        buffer.put(byteArrayOf(9, 9, 9, 9, 0, 0, 0, 0, 0, 0), 0, 4)
+        assertEquals(4, buffer.position())
+
+        val replacement = byteArrayOf(1, 2, 3, 4)
+        val written = PcmCodec.fillReadBuffer(buffer, bytesRead = 4, source = replacement)
+
+        assertEquals(4, written)
+        // 位置应还原到读取之后的状态
+        assertEquals(4, buffer.position())
+        // 前 4 个字节应被新数据替换
+        assertArrayEquals(
+            byteArrayOf(1, 2, 3, 4),
+            buffer.array().copyOf(4),
+        )
+    }
+
+    @Test
+    fun `只覆盖刚读入的那一段不影响缓冲区其他内容`() {
+        val buffer = java.nio.ByteBuffer.allocate(12)
+        // 前面已有 2 个字节的旧数据，位置在第 2
+        buffer.put(byteArrayOf(7, 7))
+        // 这次读入 4 个字节，位置推进到 6
+        buffer.put(byteArrayOf(9, 9, 9, 9))
+        assertEquals(6, buffer.position())
+
+        PcmCodec.fillReadBuffer(buffer, bytesRead = 4, source = byteArrayOf(1, 2, 3, 4))
+
+        val all = buffer.array()
+        assertArrayEquals(byteArrayOf(7, 7), all.copyOf(2))            // 之前的未被触碰
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4), all.copyOfRange(2, 6)) // 刚读入的被替换
+        assertArrayEquals(ByteArray(6), all.copyOfRange(6, 12))         // 之后的仍是初始值
+    }
+
+    @Test
+    fun `新数据较短时剩余部分填静音避免残留旧声音`() {
+        val buffer = java.nio.ByteBuffer.allocate(8)
+        buffer.put(byteArrayOf(5, 5, 5, 5, 5, 5))
+        assertEquals(6, buffer.position())
+
+        // 只提供 2 个字节，但要覆盖 6 个字节的那一段
+        val written = PcmCodec.fillReadBuffer(buffer, bytesRead = 6, source = byteArrayOf(1, 2))
+
+        assertEquals(2, written)
+        assertArrayEquals(
+            byteArrayOf(1, 2, 0, 0, 0, 0),
+            buffer.array().copyOf(6),
+        )
+    }
+
+    @Test
+    fun `写入超过读取长度的数据时不会越界`() {
+        val buffer = java.nio.ByteBuffer.allocate(8)
+        buffer.put(byteArrayOf(9, 9, 9))
+        assertEquals(3, buffer.position())
+
+        // 提供 10 个字节，但这一读只有 3 个字节需要覆盖
+        val written = PcmCodec.fillReadBuffer(buffer, bytesRead = 3, source = ByteArray(10) { 1 })
+
+        assertEquals(3, written)
+        assertArrayEquals(byteArrayOf(1, 1, 1), buffer.array().copyOf(3))
+    }
+
+    @Test
+    fun `读取长度为零或负数时不改动缓冲区`() {
+        val buffer = java.nio.ByteBuffer.allocate(8)
+        buffer.put(byteArrayOf(4, 4, 4))
+        val before = buffer.array().copyOf()
+        val posBefore = buffer.position()
+
+        assertEquals(0, PcmCodec.fillReadBuffer(buffer, bytesRead = 0, source = byteArrayOf(1)))
+        assertEquals(0, PcmCodec.fillReadBuffer(buffer, bytesRead = -3, source = byteArrayOf(1)))
+
+        assertArrayEquals(before, buffer.array())
+        assertEquals(posBefore, buffer.position())
+    }
 }

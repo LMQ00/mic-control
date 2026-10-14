@@ -150,13 +150,15 @@ class MicControlHook : IXposedHookLoadPackage {
                 }
 
                 is java.nio.ByteBuffer -> {
-                    // 直接缓冲不能越界写：只写到它剩余的可写空间为止
-                    val n = minOf(count, buffer.remaining())
+                    // 直接缓冲：录音读取已在返回前推进了它的位置，因此必须
+                    // 用专门的写法覆盖"刚读入的那一段"，不能往当前位置追加，
+                    // 否则数据落到错误偏移、替换等于没做。
+                    val n = minOf(count, buffer.capacity())
                     if (n <= 0) return
                     val bytes = ByteArray(n)
                     val got = AudioHub.read(bytes, n, READ_TIMEOUT_MS)
                     if (got <= 0) return
-                    buffer.put(bytes, 0, got)
+                    PcmCodec.fillReadBuffer(buffer, count, bytes)
                 }
             }
         } catch (t: Throwable) {

@@ -89,4 +89,42 @@ object PcmCodec {
         }
         return samples
     }
+
+    /**
+     * 用新数据覆盖直接缓冲中"刚刚读入的那一段"。
+     *
+     * 这里要特别小心：[java.nio.ByteBuffer] 版本的录音读取在返回前，
+     * 已经把它自己的位置向后推进了"读了几个字节"那么多。所以不能直接
+     * 往当前位置追加——那样数据会落在错误的偏移上，替换等于没做，
+     * 调用方拿到的仍是原来的内容。
+     *
+     * 正确做法：把位置退回本次读取的起点，写入新数据，再把位置还原到读取之后的状态。
+     * 新数据不够长时，剩余部分填静音，避免残留上一轮的旧声音。
+     *
+     * @param buffer 调用方的直接缓冲
+     * @param bytesRead 本次读取返回的字节数（决定要覆盖多长一段）
+     * @param source 要写入的新数据
+     * @return 实际写入的新数据字节数
+     */
+    fun fillReadBuffer(buffer: java.nio.ByteBuffer, bytesRead: Int, source: ByteArray): Int {
+        if (bytesRead <= 0) return 0
+
+        // 读取之后的位置就是这一段的末尾，据此算出起点
+        val end = buffer.position()
+        val start = end - bytesRead
+        if (start < 0) return 0
+
+        buffer.position(start)
+
+        // 先写新数据，能写多少写多少
+        val n = minOf(source.size, bytesRead)
+        if (n > 0) buffer.put(source, 0, n)
+
+        // 不足的部分补静音，保证这一整段都被覆盖过
+        repeat(bytesRead - n) { buffer.put(0) }
+
+        // 位置还原到读取之后的状态，让调用方看到的信息与正常读取一致
+        buffer.position(end)
+        return n
+    }
 }
