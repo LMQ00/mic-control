@@ -6,6 +6,10 @@ plugins {
 
 // 签名信息从环境变量读取（CI 里由加密变量注入）。
 // 本地不编译，所以这里不做任何回退到本地文件的处理，避免密钥意外入库。
+//
+// 没配置正式密钥时，退回用 debug 签名。注意：debug 密钥默认是每次构建环境
+// 临时生成的，会导致每次构建出来的包签名都不同、无法覆盖安装。CI 里通过
+// 缓存一个固定的 debug 密钥来避免这个问题，见 .github/workflows/build.yml。
 val keystorePath: String? = System.getenv("SIGNING_KEYSTORE_PATH")
 val keystorePassword: String? = System.getenv("SIGNING_STORE_PASSWORD")
 val keyAlias: String? = System.getenv("SIGNING_KEY_ALIAS")
