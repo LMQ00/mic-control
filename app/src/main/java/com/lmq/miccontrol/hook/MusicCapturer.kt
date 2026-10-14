@@ -1,6 +1,7 @@
 package com.lmq.miccontrol.hook
 
 import com.lmq.miccontrol.hub.AudioHub
+import com.lmq.miccontrol.hub.PcmCodec
 
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -93,43 +94,41 @@ object MusicCapturer {
         }
     }
 
-    /** 把不同重载传来的数据统一转成字节流送进通道。 */
+    /**
+     * 把不同重载传来的数据统一转成字节流送进通道。
+     *
+     * 注意各重载里"长度"的含义不同：数组类型给的是**元素个数**，
+     * 缓冲类型给的是**字节数**。这里都交给 [PcmCodec] 按各自的语义处理，
+     * 避免此处的换算出错导致两端对不上（那种情况听起来就是噪音）。
+     */
     private fun sendToHub(data: Any, length: Int) {
         if (length <= 0) return
         try {
             when (data) {
+                // 已经是字节流，直接送
                 is ByteArray -> {
                     val n = minOf(length, data.size)
                     AudioHub.write(data, 0, n)
                 }
 
+                // 16 位样本：length 是样本个数，编码后字节数是它的两倍
                 is ShortArray -> {
-                    // 16 位样本，按小端序转成字节
-                    val n = minOf(length, data.size)
-                    val bytes = ByteArray(n * 2)
-                    for (i in 0 until n) {
-                        val v = data[i].toInt()
-                        bytes[i * 2] = (v and 0xFF).toByte()
-                        bytes[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
-                    }
-                    AudioHub.write(bytes, 0, bytes.size)
+                    val bytes = ByteArray(data.size * 2)
+                    val written = PcmCodec.shortsToBytes(data, 0, length, bytes)
+                    if (written > 0) AudioHub.write(bytes, 0, written)
                 }
 
+                // 浮点样本：取值范围 -1..1
                 is FloatArray -> {
-                    // 浮点样本范围是 -1..1，转成 16 位整数
-                    val n = minOf(length, data.size)
-                    val bytes = ByteArray(n * 2)
-                    for (i in 0 until n) {
-                        val s = (data[i].coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt()
-                        bytes[i * 2] = (s and 0xFF).toByte()
-                        bytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
-                    }
-                    AudioHub.write(bytes, 0, bytes.size)
+                    val bytes = ByteArray(data.size * 2)
+                    val written = PcmCodec.floatsToBytes(data, 0, length, bytes)
+                    if (written > 0) AudioHub.write(bytes, 0, written)
                 }
 
                 is java.nio.ByteBuffer -> {
                     val buf = data.duplicate()
                     val n = minOf(length, buf.remaining())
+                    if (n <= 0) return
                     val bytes = ByteArray(n)
                     buf.get(bytes)
                     AudioHub.write(bytes, 0, n)

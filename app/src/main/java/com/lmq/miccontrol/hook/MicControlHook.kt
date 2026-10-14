@@ -7,6 +7,7 @@ import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 import com.lmq.miccontrol.hub.AudioHub
+import com.lmq.miccontrol.hub.PcmCodec
 
 /**
  * 模块入口。LSPosed 把本模块加载进目标应用进程后会调用 handleLoadPackage。
@@ -135,12 +136,7 @@ class MicControlHook : IXposedHookLoadPackage {
                     val bytes = ByteArray(n * 2)
                     val got = AudioHub.read(bytes, bytes.size, READ_TIMEOUT_MS)
                     if (got <= 0) return
-                    val samples = got / 2
-                    for (i in 0 until samples) {
-                        val lo = bytes[i * 2].toInt() and 0xFF
-                        val hi = bytes[i * 2 + 1].toInt()
-                        buffer[offset + i] = ((hi shl 8) or lo).toShort()
-                    }
+                    PcmCodec.bytesToShorts(bytes, got, buffer, offset)
                 }
 
                 is FloatArray -> {
@@ -150,13 +146,7 @@ class MicControlHook : IXposedHookLoadPackage {
                     val bytes = ByteArray(n * 2)
                     val got = AudioHub.read(bytes, bytes.size, READ_TIMEOUT_MS)
                     if (got <= 0) return
-                    val samples = got / 2
-                    for (i in 0 until samples) {
-                        val lo = bytes[i * 2].toInt() and 0xFF
-                        val hi = bytes[i * 2 + 1].toInt()
-                        val s = ((hi shl 8) or lo).toShort()
-                        buffer[offset + i] = s.toFloat() / Short.MAX_VALUE
-                    }
+                    PcmCodec.bytesToFloats(bytes, got, buffer, offset)
                 }
 
                 is java.nio.ByteBuffer -> {
