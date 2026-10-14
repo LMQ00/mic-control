@@ -32,10 +32,12 @@ android {
     if (hasSigningConfig) {
         signingConfigs {
             create("release") {
+                // 刻意都用 this. 限定：配置项的属性名和外层变量同名，
+                // 不加限定会变成"把配置项赋给自己"，导致读到空值。
                 storeFile = file(keystorePath!!)
-                storePassword = keystorePassword
+                this.storePassword = keystorePassword
                 this.keyAlias = keyAlias
-                keyPassword = keyPassword
+                this.keyPassword = keyPassword
             }
         }
     }
