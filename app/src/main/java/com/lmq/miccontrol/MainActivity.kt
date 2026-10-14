@@ -1,8 +1,11 @@
 package com.lmq.miccontrol
 
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -29,6 +32,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
@@ -37,8 +41,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 请求通知权限：通知栏那个开关需要它才能显示（新版安卓才需要）
+        requestNotificationPermissionIfNeeded()
+
         val store = SettingsStore(this)
         val candidates = AppScanner.listMusicCandidates(this)
+
+        // 打开界面时若开关是开着的，把常驻通知也补上——避免出现
+        // "开关开着却找不到通知栏入口"的情况
+        if (store.enabled) {
+            ControlNotification.show(this)
+        }
 
         setContent {
             MaterialTheme {
@@ -48,10 +61,28 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    /**
+     * 请求通知权限。
+     *
+     * 只有较新的系统需要动态申请。用户拒绝也不影响应用本身使用，
+     * 只是通知栏那个快捷开关没法用，所以这里不做任何强制。
+     */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+            .launch(android.Manifest.permission.POST_NOTIFICATIONS)
+    }
 }
 
 @Composable
 private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
+    val context = LocalContext.current
     // 用 remember 让状态在重组之间保持；初值来自存储，保证重开界面时状态不丢
     var enabled by remember { mutableStateOf(store.enabled) }
     var selected by remember { mutableStateOf(store.musicPackage) }
@@ -93,6 +124,12 @@ private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
                     onCheckedChange = {
                         enabled = it
                         store.enabled = it
+                        // 打开时挂出常驻通知（下拉即可随时关），关掉时撤掉
+                        if (it) {
+                            ControlNotification.show(context)
+                        } else {
+                            ControlNotification.cancel(context)
+                        }
                     },
                 )
             }

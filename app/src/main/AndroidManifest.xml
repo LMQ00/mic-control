@@ -10,6 +10,9 @@
         android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
+    <!-- 通知栏里的快捷开关需要它（较新系统才需要动态申请） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"
@@ -25,6 +28,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          接收通知栏按钮的点击。不导出，只有本应用自己的通知能触发它。
+        -->
+        <receiver
+            android:name=".ToggleReceiver"
+            android:exported="false" />
 
         <!--
           Xposed 模块声明。xposedmodule=true 让 LSPosed 把这个应用识别为模块；
