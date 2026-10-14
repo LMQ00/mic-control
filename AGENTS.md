@@ -43,5 +43,9 @@
 
 ## 当前状态
 
-- 文档已落盘；代码尚未开始。
-- 下一步：`git init` + 建远程仓库 + 跑通第一个里程碑（技术验证），细节见 [docs/development.md](docs/development.md) 与 [docs/testing.md](docs/testing.md)。
+- 代码已能编译出安装包并装到目标手机上；GitHub Actions 构建通过。
+- 已确认目标应用（王者荣耀、系统录音机）使用 Java 层录音接口，hook 点有真实作用对象。
+- **当前处于链路验证阶段**：代码送进麦克风的还**不是真实音乐，而是一段固定的测试音**，用于先回答"声音能否被替换"这个根本问题。
+- 已知限制：用 `MediaRecorder` 录音的应用不在当前覆盖范围内（其数据不经过 Java 层）。
+- **下一步**：重启一次手机让框架加载本模块（框架只在开机时扫描模块），然后按 [docs/testing.md](docs/testing.md) 验证能否听到测试音；通过后再把测试音换成真实音乐。
+- 排查与安装细节见 [docs/runbook.md](docs/runbook.md) 与 [docs/development.md](docs/development.md)。
