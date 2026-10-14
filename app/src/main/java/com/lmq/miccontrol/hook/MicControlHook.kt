@@ -35,6 +35,14 @@ class MicControlHook : IXposedHookLoadPackage {
         installMicReplacement(lpparam)
     }
 
+    /** 这个应用此刻该扮演什么角色。每次用到都重新算，保证改了设置立刻生效。 */
+    private fun roleNow(currentPackage: String): Role =
+        decideRole(
+            enabled = ModulePrefs.isEnabled(),
+            selectedPackage = ModulePrefs.musicPackage(),
+            currentPackage = currentPackage,
+        )
+
     /**
      * 拦截 AudioRecord.read，把声音通道里的内容交给调用方。
      *
@@ -59,12 +67,10 @@ class MicControlHook : IXposedHookLoadPackage {
             try {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: XC_MethodHook.MethodHookParam) {
-                        // 运行时判断，缺一不可：
-                        // 1. 总开关必须打开；
-                        // 2. 当前应用不能是被选中的音乐软件——音乐软件自己也可能录音，
-                        //    它是声音来源方，不该被替换。
-                        if (!ModulePrefs.isEnabled()) return
-                        if (ModulePrefs.musicPackage() == lpparam.packageName) return
+                        // 只在"这个应用该被替换麦克风"时才动手。判定集中在
+                        // decideRole 里，便于测试覆盖各种组合：开关没开、
+                        // 还没选音乐软件、或者当前就是音乐软件本身，都不该替换。
+                        if (roleNow(lpparam.packageName) != Role.REPLACE_MIC) return
 
                         val readCount = (param.result as? Int) ?: return
                         if (readCount <= 0) return

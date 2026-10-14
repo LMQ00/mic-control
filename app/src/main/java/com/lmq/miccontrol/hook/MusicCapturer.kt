@@ -54,12 +54,14 @@ object MusicCapturer {
             try {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: XC_MethodHook.MethodHookParam) {
-                        // 两个运行时判断，缺一不可：
-                        // 1. 总开关必须打开；
-                        // 2. 当前进程必须正是被选中的那个音乐应用——这样你在界面上改了选择，
-                        //    不用重启任何应用就能换一个应用来截取。
-                        if (!ModulePrefs.isEnabled()) return
-                        if (ModulePrefs.musicPackage() != lpparam.packageName) return
+                        // 只在"当前正是被选中的音乐软件"时才截取。这样你在界面上
+                        // 改了选择，不用重启任何应用就能换一个应用来截取。
+                        val role = decideRole(
+                            enabled = ModulePrefs.isEnabled(),
+                            selectedPackage = ModulePrefs.musicPackage(),
+                            currentPackage = lpparam.packageName,
+                        )
+                        if (role != Role.CAPTURE_MUSIC) return
 
                         val data = param.args.getOrNull(0) ?: return
                         val length = (param.args.getOrNull(lengthIndex) as? Int) ?: return
