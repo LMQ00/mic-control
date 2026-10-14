@@ -58,8 +58,8 @@ object MusicCapturer {
                         // 1. 总开关必须打开；
                         // 2. 当前进程必须正是被选中的那个音乐应用——这样你在界面上改了选择，
                         //    不用重启任何应用就能换一个应用来截取。
-                        if (!SwitchState.isEnabled()) return
-                        if (SettingsReader.readMusicPackage() != lpparam.packageName) return
+                        if (!ModulePrefs.isEnabled()) return
+                        if (ModulePrefs.musicPackage() != lpparam.packageName) return
 
                         val data = param.args.getOrNull(0) ?: return
                         val length = (param.args.getOrNull(lengthIndex) as? Int) ?: return

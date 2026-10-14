@@ -63,8 +63,8 @@ class MicControlHook : IXposedHookLoadPackage {
                         // 1. 总开关必须打开；
                         // 2. 当前应用不能是被选中的音乐软件——音乐软件自己也可能录音，
                         //    它是声音来源方，不该被替换。
-                        if (!SwitchState.isEnabled()) return
-                        if (SettingsReader.readMusicPackage() == lpparam.packageName) return
+                        if (!ModulePrefs.isEnabled()) return
+                        if (ModulePrefs.musicPackage() == lpparam.packageName) return
 
                         val readCount = (param.result as? Int) ?: return
                         if (readCount <= 0) return
