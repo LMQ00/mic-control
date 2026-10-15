@@ -3,6 +3,7 @@ package com.lmq.miccontrol.hub
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
+import android.util.Log
 
 import java.io.InputStream
 import java.io.OutputStream
@@ -27,6 +28,14 @@ object AudioHub {
 
     /** 通道的名字，两个进程必须一致才能对接上。 */
     private const val SOCKET_NAME = "com.lmq.miccontrol.audio"
+
+    /**
+     * 日志标记。
+     *
+     * 只记录"状态发生变化"这种少量事件（连上了、断了、收到第一批声音），
+     * 不在每次读写时打印——那会瞬间刷满日志、拖慢音频，也让人找不到重点。
+     */
+    private const val TAG = "MicControl"
 
     private const val SOCKET_BUFFER_SIZE = 64 * 1024
 
@@ -140,11 +149,13 @@ object AudioHub {
                 }
 
                 connected = true
+                Log.i(TAG, "声音通道已接通（本端${if (session.server != null) "作为等待方" else "作为连接方"}）")
                 startReceiver(session.input)
                 sendLoop(session.output)
             } catch (t: Throwable) {
                 // 连接中断属正常情况，走下面的重试
             } finally {
+                if (connected) Log.i(TAG, "声音通道已断开，稍后自动重连")
                 connected = false
                 runCatching { session?.close() }
                 sleepQuietly(RETRY_INTERVAL_MS)
@@ -221,6 +232,9 @@ object AudioHub {
     private fun startReceiver(input: InputStream) {
         Thread({
             val buf = ByteArray(16 * 1024)
+            // 每次连接只报一次"收到第一批声音"，用来确认链路真的通了。
+            // 若始终没有这一行，说明对面根本没在出声，而不是通道有问题。
+            var firstBatchLogged = false
             try {
                 while (true) {
                     val n = input.read(buf)
@@ -229,6 +243,10 @@ object AudioHub {
                         // 记下收到声音的时刻，供读取侧判断"对面是否正在出声"
                         lastIncomingAt = System.currentTimeMillis()
                         incoming.write(buf, 0, n)
+                        if (!firstBatchLogged) {
+                            firstBatchLogged = true
+                            Log.i(TAG, "已收到对方发来的声音，链路正常")
+                        }
                     }
                 }
             } catch (t: Throwable) {
