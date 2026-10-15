@@ -49,6 +49,19 @@
         <meta-data
             android:name="xposedminversion"
             android:value="82" />
+        <!--
+          声明"本模块要跨进程读取自己的设置文件"。
+
+          必须写这一条：hook 代码跑在别的应用进程里，要去读本应用的设置文件，
+          而系统默认禁止一个应用读另一个应用的数据。声明之后，框架会为本模块的
+          设置文件做特殊处理，读取才能成功。
+
+          缺了这一条的后果不是报错，而是**静默读到默认值**——开关看起来永远
+          是关的，表现为"钩子挂上了但从来不生效"，很难察觉。
+        -->
+        <meta-data
+            android:name="xposedsharedprefs"
+            android:value="true" />
 
     </application>
 

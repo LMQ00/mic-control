@@ -41,6 +41,10 @@ object MusicCapturer {
 
         log("$appId：发现 ${writeMethods.size} 个 write 重载，挂载截取")
 
+        // 只报告一次，避免刷屏
+        val reportedCall = java.util.concurrent.atomic.AtomicBoolean(false)
+        val reportedPrefs = java.util.concurrent.atomic.AtomicBoolean(false)
+
         writeMethods.forEach { method ->
             // 长度与偏移的位置都必须按方法签名判定，不能想当然：
             // - write(byte[], int offset, int size, int writeMode) 的最后一个 int
@@ -58,6 +62,14 @@ object MusicCapturer {
             try {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: XC_MethodHook.MethodHookParam) {
+                        // 只报一次"Java 层确实在播放"，用来区分两种情况：
+                        // 是音乐压根没走 Java 层（那本模块覆盖不到它），
+                        // 还是走了 Java 层但设置没读到（那是另一类问题）。
+                        if (!reportedCall) {
+                            reportedCall = true
+                            log("检测到 Java 层播放调用，说明本模块可以截取该应用")
+                        }
+
                         // 只在"当前正是被选中的音乐软件"时才截取。这样你在界面上
                         // 改了选择，不用重启任何应用就能换一个应用来截取。
                         val role = decideRole(
@@ -65,7 +77,19 @@ object MusicCapturer {
                             selectedPackage = ModulePrefs.musicPackage(),
                             currentPackage = appId,
                         )
-                        if (role != Role.CAPTURE_MUSIC) return
+                        if (role != Role.CAPTURE_MUSIC) {
+                            // 只报一次实际读到的设置值。这一步是为了能一眼区分
+                            // "设置没读到"和"读到了但角色判定不同"两种情况。
+                            if (!reportedPrefs) {
+                                reportedPrefs = true
+                                log(
+                                    "当前设置：开关=${ModulePrefs.isEnabled()}，" +
+                                        "选中的音乐软件=${ModulePrefs.musicPackage()}，" +
+                                        "本进程=$appId"
+                                )
+                            }
+                            return
+                        }
 
                         val data = param.args.getOrNull(0) ?: return
                         val length = (param.args.getOrNull(lengthIndex) as? Int) ?: return
