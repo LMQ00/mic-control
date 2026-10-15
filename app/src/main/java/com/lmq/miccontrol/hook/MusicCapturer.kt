@@ -65,8 +65,7 @@ object MusicCapturer {
                         // 只报一次"Java 层确实在播放"，用来区分两种情况：
                         // 是音乐压根没走 Java 层（那本模块覆盖不到它），
                         // 还是走了 Java 层但设置没读到（那是另一类问题）。
-                        if (!reportedCall) {
-                            reportedCall = true
+                        if (reportedCall.compareAndSet(false, true)) {
                             log("检测到 Java 层播放调用，说明本模块可以截取该应用")
                         }
 
@@ -80,8 +79,7 @@ object MusicCapturer {
                         if (role != Role.CAPTURE_MUSIC) {
                             // 只报一次实际读到的设置值。这一步是为了能一眼区分
                             // "设置没读到"和"读到了但角色判定不同"两种情况。
-                            if (!reportedPrefs) {
-                                reportedPrefs = true
+                            if (reportedPrefs.compareAndSet(false, true)) {
                                 log(
                                     "当前设置：开关=${ModulePrefs.isEnabled()}，" +
                                         "选中的音乐软件=${ModulePrefs.musicPackage()}，" +
