@@ -11,10 +11,13 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Card
@@ -54,7 +57,7 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MaterialTheme {
+            MicControlTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     ControlScreen(store, candidates)
                 }
@@ -87,7 +90,14 @@ private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
     var enabled by remember { mutableStateOf(store.enabled) }
     var selected by remember { mutableStateOf(store.musicPackage) }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            // 让内容避开状态栏和屏幕圆角：不加这个的话，
+            // 标题会被状态栏的图标压住（实机上确认过）。
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(16.dp)
+    ) {
         Text(
             text = "麦克风控制",
             style = MaterialTheme.typography.headlineSmall,

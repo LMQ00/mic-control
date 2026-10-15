@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      深色模式下的窗口底色。
+      这里必须单独给一份：界面本身由代码控制配色，但应用刚启动、界面还没画出来
+      的那一瞬间，看到的是这个窗口底色。若只有浅色一份，深色模式下会先闪一下白屏。
+    -->
+    <style name="Theme.MicControl" parent="android:Theme.Material.NoActionBar" />
+</resources>
