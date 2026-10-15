@@ -56,6 +56,10 @@ object ModulePrefs {
     @Volatile
     private var warnedFailure = false
 
+    /** 是否已经打印过"文件读不到"的提示，同样只报一次。 */
+    @Volatile
+    private var warnedUnreadable = false
+
     /** 总开关是否打开。 */
     fun isEnabled(): Boolean = readBoolean(KEY_ENABLED, false)
 
@@ -88,7 +92,18 @@ object ModulePrefs {
             // 配置文件由界面进程写入，读取由框架提供的通道完成，不依赖文件系统
             // 权限，所以这里不需要（也无法）去改文件权限——那个操作只有文件
             // 所有者才做得到，在别人的进程里调用注定失败。
-            XSharedPreferences(PACKAGE_NAME, FILE_NAME).also { prefs = it }
+            val p = XSharedPreferences(PACKAGE_NAME, FILE_NAME)
+            // 按框架的建议先确认这份文件确实可读。读不到时它会一直返回默认值
+            // 而不是报错，于是表现为"开关永远像是关着的"——先在这里把话说明白，
+            // 免得排查时误以为是钩子没挂上。
+            if (!p.file.canRead() && !warnedUnreadable) {
+                warnedUnreadable = true
+                XposedBridge.log(
+                    "[MicControl] 读不到设置文件，开关将一直是关的。" +
+                        "请确认界面是用可被框架读取的模式保存设置的。"
+                )
+            }
+            p.also { prefs = it }
         } catch (t: Throwable) {
             if (!warnedFailure) {
                 warnedFailure = true
