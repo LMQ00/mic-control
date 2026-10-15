@@ -29,7 +29,7 @@ object MusicCapturer {
      *
      * @param lpparam 当前加载的应用信息
      */
-    fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
+    fun install(lpparam: XC_LoadPackage.LoadPackageParam, appId: String) {
         val clazz = XposedHelpers.findClassIfExists(
             "android.media.AudioTrack",
             lpparam.classLoader
@@ -39,7 +39,7 @@ object MusicCapturer {
         val writeMethods = clazz.declaredMethods.filter { it.name == "write" }
         if (writeMethods.isEmpty()) return
 
-        log("${lpparam.packageName}：发现 ${writeMethods.size} 个 write 重载，挂载截取")
+        log("$appId：发现 ${writeMethods.size} 个 write 重载，挂载截取")
 
         writeMethods.forEach { method ->
             // 长度与偏移的位置都必须按方法签名判定，不能想当然：
@@ -47,13 +47,13 @@ object MusicCapturer {
             //   其实是写入模式（0 或 1），当成长度的话每次只会送出 1 个字节；
             // - 同一次调用的第 2 个参数是偏移，表示本轮声音从数组哪里开始，
             //   忽略它就会截到无关内容（播放器通常复用同一块缓冲区）。
-            val lengthIndex = lengthArgIndex(method)
+            val lengthIndex = AudioArgs.lengthIndex(method.parameterTypes)
             if (lengthIndex < 0) {
                 log("  跳过不认识的签名：${describe(method)}")
                 return@forEach
             }
             // 有偏移参数的情形：首个参数是数组（直接缓冲那种没有偏移）
-            val offsetIndex = if (method.parameterTypes.firstOrNull()?.isArray == true) 1 else -1
+            val offsetIndex = AudioArgs.offsetIndex(method.parameterTypes)
 
             try {
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
@@ -63,7 +63,7 @@ object MusicCapturer {
                         val role = decideRole(
                             enabled = ModulePrefs.isEnabled(),
                             selectedPackage = ModulePrefs.musicPackage(),
-                            currentPackage = lpparam.packageName,
+                            currentPackage = appId,
                         )
                         if (role != Role.CAPTURE_MUSIC) return
 
@@ -81,27 +81,6 @@ object MusicCapturer {
             } catch (t: Throwable) {
                 log("  hook 失败：${describe(method)} -> ${t.message}")
             }
-        }
-    }
-
-    /**
-     * 判断"要写入多少个"是第几个参数（从 0 开始）。
-     *
-     * 系统里 write 的重载只有两类形态：
-     * - `write(数组, 偏移, 长度[, 写入模式])`——长度是第 3 个参数（下标 2）
-     * - `write(直接缓冲, 长度[, 写入模式])`——长度是第 2 个参数（下标 1）
-     *
-     * 靠第一个参数的类型区分这两类，而不是靠数第几个 int。
-     *
-     * @return 参数下标；签名不认识时返回 -1
-     */
-    private fun lengthArgIndex(method: java.lang.reflect.Method): Int {
-        val types = method.parameterTypes
-        val first = types.firstOrNull() ?: return -1
-        return when {
-            java.nio.ByteBuffer::class.java.isAssignableFrom(first) -> 1
-            first.isArray -> 2
-            else -> -1
         }
     }
 

@@ -25,22 +25,46 @@ import com.lmq.miccontrol.hub.PcmCodec
  */
 class MicControlHook : IXposedHookLoadPackage {
 
+    /**
+     * 已经处理过的进程名。
+     *
+     * 同一个进程有可能触发多次回调：应用会把别的代码包（实测遇到过把网页浏览
+     * 组件的包载入自己进程的情况）也加载进来，每次都会再通知一遍。如果不拦住，
+     * 同一批方法会被反复挂上钩子，一次录音就会往通道里重复送多份声音。
+     */
+    private val installedProcesses = mutableSetOf<String>()
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // 用进程名而不是包名来识别"这是哪个应用"。
+        //
+        // 原因：包名字段报的可能是"当前正在被加载的那个代码包"，而不一定是宿主
+        // 应用本身。实测中网易云会把网页浏览组件的包载入自己的进程，那一刻回调
+        // 拿到的包名就不是网易云——用它判定角色会得出完全相反的结论
+        // （该截取音乐的应用被当成普通应用去替换麦克风）。
+        //
+        // 进程名则是宿主应用的身份，始终是它自己，不受加载了哪些代码包影响。
+        val appId = lpparam.processName ?: lpparam.packageName
+
         // 自己的界面进程不处理
-        if (lpparam.packageName == OWN_PACKAGE) return
+        if (appId == OWN_PACKAGE || appId.startsWith("$OWN_PACKAGE:")) return
 
-        log("${lpparam.packageName} 已挂载，角色在运行时判定")
+        // 同一个进程只挂一次，避免重复拦截导致声音重复
+        synchronized(installedProcesses) {
+            if (!installedProcesses.add(appId)) return
+        }
 
-        MusicCapturer.install(lpparam)
-        installMicReplacement(lpparam)
+        log("$appId 已挂载，角色在运行时判定")
+
+        MusicCapturer.install(lpparam, appId)
+        installMicReplacement(lpparam, appId)
     }
 
     /** 这个应用此刻该扮演什么角色。每次用到都重新算，保证改了设置立刻生效。 */
-    private fun roleNow(currentPackage: String): Role =
+    private fun roleNow(appId: String): Role =
         decideRole(
             enabled = ModulePrefs.isEnabled(),
             selectedPackage = ModulePrefs.musicPackage(),
-            currentPackage = currentPackage,
+            currentPackage = appId,
         )
 
     /**
@@ -48,8 +72,10 @@ class MicControlHook : IXposedHookLoadPackage {
      *
      * 这是所有 Java 层录音的必经之路：不管上层用哪个语音 SDK，
      * 最终读麦克风都会走到这里。
+     *
+     * @param appId 宿主应用的标识（进程名），用于判定角色
      */
-    private fun installMicReplacement(lpparam: XC_LoadPackage.LoadPackageParam) {
+    private fun installMicReplacement(lpparam: XC_LoadPackage.LoadPackageParam, appId: String) {
         val clazz = XposedHelpers.findClassIfExists(
             "android.media.AudioRecord",
             lpparam.classLoader
@@ -58,10 +84,10 @@ class MicControlHook : IXposedHookLoadPackage {
         val readMethods = clazz.declaredMethods.filter { it.name == "read" }
         if (readMethods.isEmpty()) return
 
-        log("${lpparam.packageName}：发现 ${readMethods.size} 个 read 重载，挂载替换")
+        log("$appId：发现 ${readMethods.size} 个 read 重载，挂载替换")
 
         readMethods.forEach { method ->
-            val lengthIndex = lengthArgIndex(method)
+            val lengthIndex = AudioArgs.lengthIndex(method.parameterTypes)
             if (lengthIndex < 0) return@forEach
 
             try {
@@ -70,7 +96,7 @@ class MicControlHook : IXposedHookLoadPackage {
                         // 只在"这个应用该被替换麦克风"时才动手。判定集中在
                         // decideRole 里，便于测试覆盖各种组合：开关没开、
                         // 还没选音乐软件、或者当前就是音乐软件本身，都不该替换。
-                        if (roleNow(lpparam.packageName) != Role.REPLACE_MIC) return
+                        if (roleNow(appId) != Role.REPLACE_MIC) return
 
                         val readCount = (param.result as? Int) ?: return
                         if (readCount <= 0) return
@@ -84,29 +110,6 @@ class MicControlHook : IXposedHookLoadPackage {
             } catch (t: Throwable) {
                 log("  hook 失败：${describe(method)} -> ${t.message}")
             }
-        }
-    }
-
-    /**
-     * 判断"要读/写多少个"是第几个参数。
-     *
-     * 系统里 read 和 write 的重载只有两类形态：
-     * - `(数组, 偏移, 长度[, 模式])`——长度是第 3 个参数（下标 2）
-     * - `(直接缓冲, 长度[, 模式])`——长度是第 2 个参数（下标 1）
-     *
-     * 必须按签名判断，不能想当然取"最后一个整数"：例如
-     * `write(byte[], int, int, int writeMode)` 的最后一个整数是写入模式（0 或 1），
-     * 当成长度的话每次就只送出 1 个字节。
-     *
-     * @return 参数下标；签名不认识时返回 -1
-     */
-    private fun lengthArgIndex(method: java.lang.reflect.Method): Int {
-        val types = method.parameterTypes
-        val first = types.firstOrNull() ?: return -1
-        return when {
-            java.nio.ByteBuffer::class.java.isAssignableFrom(first) -> 1
-            first.isArray -> 2
-            else -> -1
         }
     }
 
