@@ -5,6 +5,7 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -43,6 +44,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 启用边到边显示。
+        //
+        // 这一步不能省：从较新的系统开始，应用默认就是边到边绘制的，也就是内容
+        // 会铺到状态栏底下。若不主动声明，状态栏图标的明暗不会跟随深浅色变化——
+        // 实机上出现过浅色背景下状态栏图标仍是白色、几乎看不清的问题。
+        // 这里的调用会自动根据当前深浅色调整图标明暗。
+        enableEdgeToEdge()
 
         // 请求通知权限：通知栏那个开关需要它才能显示（新版安卓才需要）
         requestNotificationPermissionIfNeeded()
