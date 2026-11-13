@@ -47,6 +47,19 @@ jobs:
           echo "SIGNING_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           echo "签名密钥已还原"
 
+      - name: 编译原生工具与载荷
+        run: |
+          # 两个 aarch64 目标共用同一份源码。工具是独立可执行文件；
+          # 载荷是共享库，由注入工具加载进系统声音进程。
+          mkdir -p app/build/native
+          CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
+          "$CC" -O2 -Wall -o app/build/native/mcinject native/mcinject.c
+          "$CC" -shared -fPIC -O2 -nostdlib -fno-stack-protector -fno-exceptions \
+            -fno-builtin -mbranch-protection=bti \
+            -o app/build/native/libmcpayload.so native/mcpayload.c
+          chmod 755 app/build/native/mcinject app/build/native/libmcpayload.so
+          ls -l app/build/native/
+
       - name: 赋予 gradlew 执行权限
         run: chmod +x ./gradlew
 

@@ -72,6 +72,14 @@ android {
         buildConfig = true
     }
 
+    sourceSets {
+        getByName("main") {
+            // 原生工具与载荷由 CI 里的脚本编译，产物直接作为资源打进安装包，
+            // 运行时再释放到系统声音进程能读到的位置。
+            assets.srcDirs("src/main/assets", layout.buildDirectory.dir("native").get().asFile)
+        }
+    }
+
     packaging {
         resources {
             excludes += setOf("META-INF/xposed/*")
@@ -80,10 +88,9 @@ android {
 }
 
 dependencies {
-    // Xposed 传统 API：只参与编译，运行时由 LSPosed 框架提供，绝不能打进 APK
-    compileOnly("de.robv.android.xposed:api:82")
-
     implementation("androidx.core:core-ktx:1.17.0")
+    // 装/卸钩子要在后台线程跑，避免界面卡住
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.4")
     implementation("androidx.activity:activity-compose:1.11.0")
 

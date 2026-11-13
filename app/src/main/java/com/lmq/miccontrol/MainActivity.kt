@@ -33,12 +33,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -95,9 +97,39 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val injector = remember { Injector(context) }
+
     // 用 remember 让状态在重组之间保持；初值来自存储，保证重开界面时状态不丢
     var enabled by remember { mutableStateOf(store.enabled) }
     var selected by remember { mutableStateOf(store.musicPackage) }
+    var message by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+
+    /** 把当前选择落到系统上。开关关着时只是把钩子撤掉。 */
+    fun apply(on: Boolean) {
+        busy = true
+        scope.launch {
+            val uid = store.uidOf(selected)
+            val result = if (on) {
+                if (uid == null) {
+                    Result.failure(IllegalStateException("先选一个音乐软件"))
+                } else {
+                    injector.enable(uid)
+                }
+            } else {
+                injector.disable()
+            }
+            busy = false
+            message = result.getOrElse { "操作没成功：${it.message}" }
+            // 失败就把开关退回原状态，避免界面显示"开着"实际没开
+            if (result.isFailure) {
+                enabled = false
+                store.enabled = false
+                ControlNotification.cancel(context)
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -134,24 +166,34 @@ private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("启用", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        text = if (enabled) "已打开：麦克风输入的是音乐" else "已关闭：麦克风正常工作",
+                        text = when {
+                            busy -> "正在处理…"
+                            enabled -> "已打开：麦克风输入的是音乐"
+                            else -> "已关闭：麦克风正常工作"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
                 Switch(
                     checked = enabled,
-                    onCheckedChange = {
-                        enabled = it
-                        store.enabled = it
-                        // 打开时挂出常驻通知（下拉即可随时关），关掉时撤掉
-                        if (it) {
+                    enabled = !busy,
+                    onCheckedChange = { want ->
+                        enabled = want
+                        store.enabled = want
+                        if (want) {
                             ControlNotification.show(context)
                         } else {
                             ControlNotification.cancel(context)
                         }
+                        apply(want)
                     },
                 )
             }
+        }
+
+        if (message.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Text(message, style = MaterialTheme.typography.bodySmall)
         }
 
         Spacer(Modifier.height(24.dp))
@@ -179,6 +221,8 @@ private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
                         onSelect = {
                             selected = app.packageName
                             store.musicPackage = app.packageName
+                            // 换应用时若开关是开着的，立刻按新应用重装
+                            if (enabled) apply(true)
                         },
                     )
                     HorizontalDivider()
