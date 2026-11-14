@@ -54,8 +54,11 @@ jobs:
           mkdir -p app/build/native
           CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang"
           "$CC" -O2 -Wall -o app/build/native/mcinject native/mcinject.c
+          # 载荷的接口符号必须导出，注入工具靠符号名找到它们。
+          # 显式指定默认可见性并导出动态符号表，避免不同工具链的默认策略差异。
           "$CC" -shared -fPIC -O2 -nostdlib -fno-stack-protector -fno-exceptions \
-            -fno-builtin -mbranch-protection=bti \
+            -fno-builtin -mbranch-protection=bti -fvisibility=default \
+            -Wl,--export-dynamic \
             -o app/build/native/libmcpayload.so native/mcpayload.c
           chmod 755 app/build/native/mcinject app/build/native/libmcpayload.so
           ls -l app/build/native/

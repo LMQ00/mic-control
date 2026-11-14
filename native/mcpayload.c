@@ -273,9 +273,9 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
 }
 
 __asm__(
-".text\n.global mc_cap\n.hidden mc_cap\n.type mc_cap, %function\n.p2align 4\n"
+".text\n.local mc_cap\n.type mc_cap, %function\n.p2align 4\n"
 "mc_cap:\n  bti jc\n  b mc_cap_c\n.size mc_cap, .-mc_cap\n"
-".global mc_inj\n.hidden mc_inj\n.type mc_inj, %function\n.p2align 4\n"
+".local mc_inj\n.type mc_inj, %function\n.p2align 4\n"
 "mc_inj:\n  bti jc\n  b mc_inj_c\n.size mc_inj, .-mc_inj\n"
 );
 extern i64 mc_cap(void*, void*);
