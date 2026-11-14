@@ -293,6 +293,12 @@ static int cmd_on(const char *payload, uint64_t target) {
     uint64_t hcap = call2(f_hcap, 0, 0);
     uint64_t hinj = call2(f_hinj, 0, 0);
     uint64_t rc = call4(f_install, af, hal, hcap, hinj);
+    uint64_t f_diag = psym(payload, "mc_diag", pp, sizeof pp);
+    if (f_diag) {
+        fprintf(stderr, "诊断：fd=%lld 影子=%#llx 影首=%#llx 入首=%#llx\n",
+            (long long)call2(f_diag, 0, 0), (unsigned long long)call2(f_diag, 1, 0),
+            (unsigned long long)call2(f_diag, 2, 0), (unsigned long long)call2(f_diag, 3, 0));
+    }
     if ((long)rc != 0) { fprintf(stderr, "装跳板失败：%ld\n", (long)rc); do_detach(); return 1; }
     call2(f_target, target, 0);
     call2(f_on, 0, 0);
@@ -365,6 +371,60 @@ static int cmd_status(const char *payload) {
     return 0;
 }
 
+/* 把环形缓冲的一段取出来，按十进制逐行打印 */
+static int cmd_dump(const char *payload, uint64_t start, uint64_t n) {
+    g_pid = find_proc(NULL);
+    if (g_pid <= 0) { fprintf(stderr, "声音服务没在跑\n"); return 1; }
+    if (!already_loaded(payload)) { fprintf(stderr, "未启用\n"); return 1; }
+    if (do_attach()) { do_detach(); return 1; }
+
+    uint64_t cb = 0; char cp[512] = {0};
+    if (maps_find("bionic/libc.so", &cb, cp, sizeof cp)) { do_detach(); return 1; }
+    uint64_t o_malloc = esym(cp, "malloc");
+    if (!o_malloc) { do_detach(); return 1; }
+    uint64_t buf = call2(cb + o_malloc, 65536, 0);
+
+    uint64_t f_dump = psym(payload, "mc_dump", NULL, 0);
+    uint64_t f_rp = psym(payload, "mc_srcrp", NULL, 0);
+    uint64_t f_wf = psym(payload, "mc_wf", NULL, 0);
+    if (!f_dump) { fprintf(stderr, "载荷里缺少取数据函数\n"); do_detach(); return 1; }
+
+    uint64_t rp = f_rp ? call2(f_rp, 0, 0) : 0;
+    uint64_t wf = f_wf ? call2(f_wf, 0, 0) : 0;
+    fprintf(stderr, "写位置=%llu 读位置=%llu\n",
+            (unsigned long long)wf, (unsigned long long)rp);
+
+    uint64_t got = call4(f_dump, start, n, buf, 0);
+    if (!got) { fprintf(stderr, "没有数据\n"); do_detach(); return 1; }
+    int16_t *v = malloc(got * 2);
+    mr(buf, v, got * 2);
+    do_detach();
+    for (uint64_t i = 0; i < got; i++) printf("%d\n", v[i]);
+    return 0;
+}
+
+/* 把采集到的原始缓冲前若干字节按十六进制打印 */
+static int cmd_raw(const char *payload, uint64_t n) {
+    g_pid = find_proc(NULL);
+    if (g_pid <= 0) { fprintf(stderr, "声音服务没在跑\n"); return 1; }
+    if (!already_loaded(payload)) { fprintf(stderr, "未启用\n"); return 1; }
+    if (do_attach()) { do_detach(); return 1; }
+    uint64_t cb = 0; char cp[512] = {0};
+    if (maps_find("bionic/libc.so", &cb, cp, sizeof cp)) { do_detach(); return 1; }
+    uint64_t o_malloc = esym(cp, "malloc");
+    uint64_t buf = call2(cb + o_malloc, 8192, 0);
+    uint64_t f = psym(payload, "mc_rawdump", NULL, 0);
+    if (!f) { fprintf(stderr, "缺少导出函数\n"); do_detach(); return 1; }
+    uint64_t got = call2(f, buf, n);
+    if (!got) { fprintf(stderr, "没有数据\n"); do_detach(); return 1; }
+    unsigned char *v = malloc(got);
+    mr(buf, v, got);
+    do_detach();
+    for (uint64_t i = 0; i < got; i++) printf("%02x%s", v[i], (i % 16 == 15) ? "\n" : " ");
+    printf("\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     alarm(240);
     if (argc < 3) {
@@ -372,7 +432,8 @@ int main(int argc, char **argv) {
             "用法：\n"
             "  %s on <载荷路径> <目标uid>\n"
             "  %s off <载荷路径>\n"
-            "  %s status <载荷路径>\n", argv[0], argv[0], argv[0]);
+            "  %s status <载荷路径>\n"
+            "  %s dump <载荷路径> <起始帧> <帧数>\n", argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
     const char *cmd = argv[1];
@@ -383,6 +444,15 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "off")) return cmd_off(payload);
     if (!strcmp(cmd, "status")) return cmd_status(payload);
+    if (!strcmp(cmd, "raw")) {
+        uint64_t n = argc > 3 ? strtoull(argv[3], NULL, 0) : 256;
+        return cmd_raw(payload, n);
+    }
+    if (!strcmp(cmd, "dump")) {
+        uint64_t start = argc > 3 ? strtoull(argv[3], NULL, 10) : 0;
+        uint64_t n = argc > 4 ? strtoull(argv[4], NULL, 10) : 4096;
+        return cmd_dump(payload, start, n);
+    }
     fprintf(stderr, "未知命令：%s\n", cmd);
     return 1;
 }
