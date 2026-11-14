@@ -335,6 +335,52 @@ static int cmd_off(const char *payload) {
     return 0;
 }
 
+static int cmd_st(const char *payload) {
+    g_pid = find_proc(NULL);
+    if (g_pid <= 0) { fprintf(stderr, "声音服务没在跑\n"); return 1; }
+    if (!already_loaded(payload)) { fprintf(stderr, "未启用\n"); return 1; }
+    if (do_attach()) { do_detach(); return 1; }
+    uint64_t f_st = psym(payload, "mc_st", NULL, 0);
+    uint64_t f_stn = psym(payload, "mc_stn", NULL, 0);
+    uint64_t f_cnt = psym(payload, "mc_stcnt", NULL, 0);
+    uint64_t n = f_stn ? call2(f_stn, 0, 0) : 0;
+    printf("流数=%llu\n", (unsigned long long)n);
+    for (uint64_t i = 0; i < n && i < 12; i++) {
+        uint64_t self = call2(f_st, i, 0);
+        uint64_t rp   = call2(f_st, i, 1);
+        uint64_t rate = call2(f_st, i, 3);
+        uint64_t ch   = call2(f_st, i, 4);
+        uint64_t cnt  = f_cnt ? call2(f_cnt, i, 0) : 0;
+        uint64_t f_step = psym(payload, "mc_step", NULL, 0);
+        uint64_t step = f_step ? call2(f_step, i, 0) : 0;
+        printf("  [%llu] self=%#llx 速率=%llu 步长=%.4f 声道=%llu 次数=%llu 读=%llu\n",
+               (unsigned long long)i, (unsigned long long)self,
+               (unsigned long long)rate, step / 65536.0,
+               (unsigned long long)ch, (unsigned long long)cnt, (unsigned long long)rp);
+    }
+    do_detach();
+    return 0;
+}
+
+/* 往环形缓冲填一段已知频率的正弦，用于自检 */
+static int cmd_sine(const char *payload, uint64_t freq, uint64_t frames, uint64_t rate) {
+    g_pid = find_proc(NULL);
+    if (g_pid <= 0) { fprintf(stderr, "声音服务没在跑\n"); return 1; }
+    if (!already_loaded(payload)) { fprintf(stderr, "未启用\n"); return 1; }
+    if (do_attach()) { do_detach(); return 1; }
+    uint64_t f_fill = psym(payload, "mc_fillsine", NULL, 0);
+    uint64_t f_on = psym(payload, "mc_on", NULL, 0);
+    uint64_t f_cr = psym(payload, "mc_setcaprate", NULL, 0);
+    if (!f_fill) { fprintf(stderr, "载荷里缺少填充函数\n"); do_detach(); return 1; }
+    if (f_cr && rate) call2(f_cr, rate, 0);
+    uint64_t rc = call2(f_fill, freq, frames);
+    if (f_on) call2(f_on, 0, 0);
+    do_detach();
+    printf("已填入 %llu 帧 %llu 赫兹正弦\n",
+           (unsigned long long)frames, (unsigned long long)freq);
+    return rc ? 1 : 0;
+}
+
 /* 两处入口是否还是我们写的跳转字节 */
 static int hooks_present(void) {
     uint64_t af = 0, hal = 0;
@@ -363,6 +409,26 @@ static int cmd_status(const char *payload) {
         if (f_cap) cap = call2(f_cap, 0, 0);
         if (f_sub) sub = call2(f_sub, 0, 0);
         if (f_uid) uid = call2(f_uid, 0, 0);
+    }
+    {
+        uint64_t f_rate = psym(payload, "mc_rate", NULL, 0);
+        uint64_t f_lb = psym(payload, "mc_last", NULL, 0);
+        uint64_t f_lf = f_lb, f_lfs = f_lb;
+        uint64_t f_av = psym(payload, "mc_avail", NULL, 0);
+        uint64_t f_wf2 = psym(payload, "mc_wf", NULL, 0);
+        uint64_t rate = f_rate ? call2(f_rate, 0, 0) : 0;
+        uint64_t lb = f_lb ? call2(f_lb, 0, 0) : 0;
+        uint64_t lf = f_lf ? call2(f_lf, 1, 0) : 0;
+        uint64_t lfs = f_lfs ? call2(f_lfs, 2, 0) : 0;
+        uint64_t av = f_av ? call2(f_av, 0, 0) : 0;
+        uint64_t wf = f_wf2 ? call2(f_wf2, 0, 0) : 0;
+        uint64_t f_cr = psym(payload, "mc_caprate", NULL, 0);
+        uint64_t cr = f_cr ? call2(f_cr, 0, 0) : 0;
+
+        printf("速率=%llu 缓冲速率=%llu 字节=%llu 帧=%llu 帧字节=%llu 可用=%llu 写=%llu\n",
+               (unsigned long long)rate, (unsigned long long)cr, (unsigned long long)lb,
+               (unsigned long long)lf, (unsigned long long)lfs,
+               (unsigned long long)av, (unsigned long long)wf);
     }
     do_detach();
     if (!on) { printf("未启用\n"); return 0; }
@@ -433,7 +499,8 @@ int main(int argc, char **argv) {
             "  %s on <载荷路径> <目标uid>\n"
             "  %s off <载荷路径>\n"
             "  %s status <载荷路径>\n"
-            "  %s dump <载荷路径> <起始帧> <帧数>\n", argv[0], argv[0], argv[0], argv[0]);
+            "  %s dump <载荷路径> <起始帧> <帧数>\n"
+            "  %s sine <载荷路径> <频率> <帧数> <缓冲速率>\n", argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
     const char *cmd = argv[1];
@@ -444,6 +511,12 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "off")) return cmd_off(payload);
     if (!strcmp(cmd, "status")) return cmd_status(payload);
+    if (!strcmp(cmd, "st")) return cmd_st(payload);
+    if (!strcmp(cmd, "sine")) {
+        return cmd_sine(payload, argc > 3 ? strtoull(argv[3], 0, 0) : 440,
+                        argc > 4 ? strtoull(argv[4], 0, 0) : 480000,
+                        argc > 5 ? strtoull(argv[5], 0, 0) : 0);
+    }
     if (!strcmp(cmd, "raw")) {
         uint64_t n = argc > 3 ? strtoull(argv[3], NULL, 0) : 256;
         return cmd_raw(payload, n);

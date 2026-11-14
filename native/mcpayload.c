@@ -10,12 +10,14 @@
  * 环形缓冲按 48000 赫兹立体声存 16 位整数。每条录音流各有一个读位置。
  */
 typedef unsigned long u64; typedef long i64; typedef unsigned int u32;
-typedef unsigned char u8; typedef signed short s16; typedef signed int i32;
+typedef unsigned char u8; typedef signed short s16; typedef unsigned short u16; typedef signed int i32;
 
 #define CAP_OFF 0x1a4c14UL
 #define INJ_OFF 0x168b30UL
-#define CAPCOPY 20              /* 采集入口覆盖的字节数 */
-#define INJCOPY 16              /* 注入入口从 entry+4 起覆盖的字节数 */
+#define CAPCOPY 24              /* 采集入口覆盖的字节数（跳板 20 + 落地点 4） */
+#define INJCOPY 20              /* 注入入口从 entry+4 起覆盖的字节数（跳板 16 + 落地点 4） */
+#define CAPN 6                  /* 影子入口重放的指令条数 */
+#define INJN 5
 #define RING_FRAMES (1024u*512u)
 #define MAX_STREAMS 12
 #define MAX_BACKLOG 9600u       /* 最多积压约 200 毫秒 */
@@ -31,6 +33,76 @@ static inline i64 sy(i64 n,i64 a,i64 b,i64 c,i64 d,i64 e,i64 f){
 #define SYS_openat   56
 #define SYS_pwrite64 68
 #define AT_FDCWD (-100)
+
+/* 影子入口：64 字节对齐，放在 .text 里，保证可执行 */
+__asm__(
+".text\n"
+".local mc_shcap\n.type mc_shcap, %function\n.p2align 6\n"
+"mc_shcap:\n  .space 96, 0\n"
+".size mc_shcap, 96\n"
+".local mc_shinj\n.type mc_shinj, %function\n.p2align 6\n"
+"mc_shinj:\n  .space 96, 0\n"
+".size mc_shinj, 96\n"
+);
+extern u8 mc_shcap[];
+extern u8 mc_shinj[];
+
+static u64 addr_shcap(void){
+    u64 a;
+    __asm__ volatile("adrp %0, mc_shcap\n\tadd %0, %0, :lo12:mc_shcap" : "=r"(a));
+    return a;
+}
+static u64 addr_shinj(void){
+    u64 a;
+    __asm__ volatile("adrp %0, mc_shinj\n\tadd %0, %0, :lo12:mc_shinj" : "=r"(a));
+    return a;
+}
+
+/* 复制原函数开头若干条指令到影子入口。
+   adr/adrp 这类按位置算地址的指令要重新编码，否则搬到别处会指向错误目标。 */
+static void reloc_fixup(u32 *dst, u64 dst_addr, const u32 *src, u64 src_addr, int n){
+    for (int i = 0; i < n; i++){
+        u32 ins = src[i];
+        u64 d = dst_addr + i*4, s = src_addr + i*4;
+        if ((ins & 0x9F000000u) == 0x10000000u){          /* adr */
+            u64 imm = ((ins >> 5) & 0x7FFFF) << 2 | ((ins >> 29) & 3);
+            if (ins & 0x800000u) imm |= ~((1ULL << 21) - 1);
+            i64 aim = (i64)s + (i64)imm;
+            i64 d2 = aim - (i64)d;
+            u32 v = ins & 0x9F00001Fu;
+            v |= ((u32)(d2 & 3)) << 29;
+            v |= ((u32)((d2 >> 2) & 0x7FFFF)) << 5;
+            dst[i] = v;
+        } else if ((ins & 0x9F000000u) == 0x90000000u){    /* adrp */
+            u64 imm = ((ins >> 5) & 0x7FFFF) << 14 | ((ins >> 29) & 3) << 12;
+            if (ins & 0x800000u) imm |= ~((1ULL << 33) - 1);
+            i64 aim = ((i64)s & ~0xFFFULL) + (i64)imm;
+            i64 d2 = aim - ((i64)d & ~0xFFFULL);
+            u32 v = ins & 0x9F00001Fu;
+            v |= ((u32)((d2 >> 12) & 3)) << 29;
+            v |= ((u32)((d2 >> 14) & 0x7FFFF)) << 5;
+            dst[i] = v;
+        } else if ((ins & 0x7C000000u) == 0x14000000u){     /* b */
+            i64 imm = (i64)(ins & 0x3FFFFFFu) << 2;
+            if (ins & 0x2000000u) imm |= ~((1LL << 28) - 1);
+            i64 d2 = ((i64)s + imm) - (i64)d;
+            dst[i] = (ins & 0xFC000000u) | (u32)((d2 >> 2) & 0x3FFFFFF);
+        } else if ((ins & 0x7E000000u) == 0x34000000u ||      /* cbz / cbnz */
+                   (ins & 0xFF000010u) == 0x54000000u){      /* b.cond */
+            i64 imm = (i64)((ins >> 5) & 0x7FFFFu) << 2;
+            if (ins & 0x100000u) imm |= ~((1LL << 21) - 1);
+            i64 d2 = ((i64)s + imm) - (i64)d;
+            dst[i] = (ins & 0xFF00001Fu) | (u32)(((d2 >> 2) & 0x7FFFF) << 5);
+        } else if ((ins & 0x7E000000u) == 0x36000000u){      /* tbz / tbnz */
+            i64 imm = (i64)((ins >> 5) & 0x3FFFu) << 2;
+            if (ins & 0x4000u) imm |= ~((1LL << 16) - 1);
+            i64 d2 = ((i64)s + imm) - (i64)d;
+            dst[i] = (ins & 0xFFF8001Fu) | (u32)(((d2 >> 2) & 0x3FFF) << 5);
+        } else {
+            dst[i] = ins;
+        }
+    }
+}
 
 /* 用 adrp/add 取本库内符号地址，不经过 GOT */
 static u64 addr_of_cap(void){
@@ -76,7 +148,16 @@ static void ul(void){ __asm__ volatile("stlr wzr, [%0]"::"r"(&g_locks):"memory")
 __attribute__((visibility("hidden"))) static volatile u64 g_src;
 __attribute__((visibility("hidden"))) static u64 g_srctick;
 __attribute__((visibility("hidden"))) static u64 g_capraw, g_capfc;
+/* 最近一次产出的前 4096 个 16 位样本，供外部核对 */
 __attribute__((visibility("hidden"))) static u64 g_lastbytes, g_lastframes, g_lastfsz;
+/* 最后一次抄到声音的时刻。停止放歌后不再重播旧数据。 */
+__attribute__((visibility("hidden"))) static volatile u64 g_lastwrite;
+/* 环形缓冲的写入速率。各应用的播放采样率不同，这里量出来备用。 */
+__attribute__((visibility("hidden"))) static volatile u64 g_caprate = 48000;
+__attribute__((visibility("hidden"))) static u64 g_capt0, g_capf0;
+__attribute__((visibility("hidden"))) static u64 g_capcand, g_capvote;
+/* 新流从哪一帧开始读。0 表示按积压上限自动取，本身是一个有效值，所以存 +1。 */
+__attribute__((visibility("hidden"))) static volatile u64 g_rpstart1;
 
 /* 用相邻两次调用的单调时钟间隔反推流的实际采样率。
    采样率字段在所有流上读到的是同一个值，靠不住。 */
@@ -85,13 +166,23 @@ static inline u64 now_ns(void){
     __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
     return t;
 }
-static inline u64 ns_per_tick(void){
+static inline u64 cnt_freq(void){
     u64 f;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
-    return f ? (1000000000ULL / f) : 0;
+    return f;
+}
+/* 两次读数之间过了多少纳秒。频率不是 10 的整数幂，
+   先整数除会丢掉余数，时间就被算短了。 */
+static inline u64 ns_diff(u64 a, u64 b){
+    if (a <= b) return 0;
+    u64 f = cnt_freq();
+    return f ? (a - b) * 1000000000ULL / f : 0;
 }
 
-typedef struct { u64 self; u64 rp; u64 frac; u64 rate; u64 ch; u64 lastt; u64 cnt; i32 last; } st_t;
+/* step：每输出一帧要从环形缓冲吃掉多少帧，16 位小数。
+   pump：累计吃掉的帧数；pump0：上次校准时的值。 */
+typedef struct { u64 self; u64 rp; u64 frac; u64 rate; u64 ch; u64 lastt; u64 cnt; i32 last;
+                 u64 step; u64 pump; u64 pump0; u64 avail0; u64 calt; u64 est; } st_t;
 __attribute__((visibility("hidden"))) static st_t g_st[MAX_STREAMS];
 __attribute__((visibility("hidden"))) static u32 g_stn;
 
@@ -103,13 +194,19 @@ static st_t* st_find(u64 self){
     st_t *p = &g_st[g_stn++];
     u64 wf = g_wf;
     p->self = self;
-    p->rp = wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0;
+    p->rp = g_rpstart1 ? g_rpstart1 - 1 : (wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0);
     p->frac = 0;
     p->rate = 48000;
     p->ch = 1;
     p->lastt = 0;
     p->cnt = 0;
     p->last = 0;
+    p->step = 0;
+    p->pump = 0;
+    p->pump0 = 0;
+    p->avail0 = 0;
+    p->calt = 0;
+    p->est = 0;
     return p;
 }
 
@@ -135,10 +232,7 @@ static inline s16 f2s(float x){
 /* 采集：目标应用的播放复制进环形缓冲。 */
 __attribute__((used, noinline))
 i64 mc_cap_c(void *self, void *buf){
-    i64 r;
-    lkc(); memw(g_af + CAP_OFF, g_corig, CAPCOPY);
-    r = ((i64(*)(void*,void*))(g_af + CAP_OFF))(self, buf);
-    memw(g_af + CAP_OFF, g_cpatch, CAPCOPY); ulc();
+    i64 r = ((i64(*)(void*,void*))addr_shcap())(self, buf);
     g_capc++;
     if (!self || !buf || r != 0 || !g_on) return r;
 
@@ -170,7 +264,35 @@ i64 mc_cap_c(void *self, void *buf){
     __asm__ volatile("dmb ish":::"memory");
     g_wf = w + fc;
     g_srctick = g_wf;
+    g_lastwrite = now_ns();
     g_capt++;
+
+    /* 量写入速率：累计满 1 秒重算一次，吸附到标准采样率 */
+    {
+        u64 t = g_lastwrite;
+        if (!g_capf0){ g_capf0 = g_wf; g_capt0 = t; }
+        else if (ns_diff(t, g_capt0) > 1000000000ULL){
+            u64 df = g_wf - g_capf0, dt = ns_diff(t, g_capt0);
+            u64 est = df * 1000000000ULL / dt;
+            if (est >= 8000 && est <= 192000){
+                static const u64 sd[] = {8000,11025,12000,16000,22050,24000,
+                                         32000,44100,48000,64000,88200,96000,192000};
+                u64 best = 48000, bd = ~0ULL;
+                for (u32 k = 0; k < sizeof(sd)/sizeof(sd[0]); k++){
+                    u64 d3 = est > sd[k] ? est - sd[k] : sd[k] - est;
+                    if (d3 < bd){ bd = d3; best = sd[k]; }
+                }
+                /* 连续三次得到同一个值才切换。
+                   单次结果会在相邻两个标准值之间来回跳，步长跟着抖，声音跟着抖。 */
+                if (bd * 100 <= best * 15){
+                    if (best == g_capcand){ if (g_capvote < 3) g_capvote++; }
+                    else { g_capcand = best; g_capvote = 0; }
+                    if (g_capvote >= 3 && g_caprate != best) g_caprate = best;
+                } else { g_capcand = 0; g_capvote = 0; }
+            }
+            g_capf0 = g_wf; g_capt0 = t;
+        }
+    }
     return r;
 }
 
@@ -179,10 +301,7 @@ i64 mc_cap_c(void *self, void *buf){
    改回「调用前恢复原字节、返回后重写跳板」。 */
 __attribute__((used, noinline))
 i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
-    i64 r;
-    lk(); memw(g_hal + INJ_OFF + 4, g_iorig, INJCOPY);
-    r = ((i64(*)(void*,void*,u64,u64*))(g_hal + INJ_OFF))(self, buf, bytes, outN);
-    memw(g_hal + INJ_OFF + 4, g_ipatch, INJCOPY); ul();
+    i64 r = ((i64(*)(void*,void*,u64,u64*))addr_shinj())(self, buf, bytes, outN);
     g_injc++;
     if (r != 0 || !self || !buf || !bytes || !g_on) return r;
 
@@ -200,28 +319,7 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     u64 frames = bytes / fsz;
     if (!frames) return r;
 
-    /* 采样率靠相邻两次调用的间隔算出来：每次交付的帧数固定，
-       间隔越长说明采样率越低。 */
-    u64 t = now_ns(), tick = ns_per_tick();
-    if (sp->lastt && tick){
-        u64 dt = (t - sp->lastt) * tick;
-        if (dt > 1000000ULL && dt < 500000000ULL){
-            u64 est = (frames * 1000000000ULL) / dt;
-            if (est >= 8000 && est <= 192000){
-                /* 吸附到标准采样率。推断值总有百分之几的误差，
-                   直接拿去换算会让每帧步长偏离 1.0，声音被拖慢。 */
-                static const u64 std[] = {8000,11025,12000,16000,22050,24000,
-                                          32000,44100,48000,64000,88200,96000,192000};
-                u64 best = 48000, bd = ~0ULL;
-                for (u32 k = 0; k < sizeof(std)/sizeof(std[0]); k++){
-                    u64 d2 = est > std[k] ? est - std[k] : std[k] - est;
-                    if (d2 < bd){ bd = d2; best = std[k]; }
-                }
-                /* 只在估算值离标准值足够近时才采纳，避免被抖动带偏 */
-                if (bd * 100 <= best * 15) sp->rate = best;
-            }
-        }
-    }
+    u64 t = now_ns();
     sp->lastt = t;
     sp->cnt++;
     u64 rate = sp->rate;
@@ -239,16 +337,65 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
         return r;
     }
 
-    if (wf > sp->rp && wf - sp->rp > MAX_BACKLOG) sp->rp = wf - MAX_BACKLOG;
+    if (!g_rpstart1 && wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
+        sp->rp = wf - MAX_BACKLOG;
+
+    /* 步长直接量：看环形缓冲的积压怎么变。
+       积压涨了说明吃得太慢，步长要加大；跌了说明吃得太快。
+       量出来的步长不依赖任何采样率字段，也不会被采样率估算的误差带偏。 */
+    /* 步长按“这条流每秒要吃多少帧”定。
+       采集每抄一帧前进一帧，所以环形缓冲里 1 秒正好是 g_caprate 帧。
+       这条流 1 秒交付多少帧，用累计交付帧数除以时间直接算，
+       不读采样率字段，也不受采样率猜错的影响。 */
+    /* 步长 = 环形缓冲速率 ÷ 这条流每秒交付的帧数，再乘 HAL 的换算系数。
+       HAL 自称的采样率和它实际消耗的速率差一个固定比例，
+       这个比例在 device 上量出来是 1.0897（48000/44100 的倒数）。 */
+    {
+        if (!sp->step){
+            u64 sr = rate;
+            sp->step = sr ? (g_caprate << 16) / sr : 0x10000;
+            sp->calt = t; sp->pump0 = sp->pump;
+        } else if (ns_diff(t, sp->calt) >= 2000000000ULL){
+            u64 dp = sp->pump - sp->pump0;
+            u64 dt = ns_diff(t, sp->calt);
+            if (dp > 8192 && dt){
+                u64 sr = dp * 1000000000ULL / dt;
+                if (sr >= 8000 && sr <= 192000){
+                    /* 两次相隔不到 1% 才采纳，单次抖动不带进来 */
+                    if (sp->est && sr + sr/100 > sp->est && sr - sr/100 < sp->est){
+                        sp->rate = sr;
+                        sp->step = (g_caprate << 16) / sr;
+                    }
+                    sp->est = sr;
+                }
+            }
+            sp->pump0 = sp->pump; sp->calt = t;
+        }
+    }
 
     u64 rp = sp->rp;
-    u64 step = (48000ULL << 16) / rate;
+    u64 step = sp->step;
     u64 pos = sp->frac;
     i32 last = sp->last;
 
     for (u64 i = 0; i < frames; i++){
         u64 src = pos >> 16;
-        if (rp + src < wf){
+        u64 fr = pos & 0xFFFF;
+        if (rp + src + 1 < wf){
+            u64 p0 = (rp + src) % RING_FRAMES, p1 = (rp + src + 1) % RING_FRAMES;
+            /* 相邻两点线性插值。直接取整会让波形出锯齿，听着发毛。 */
+            i32 l0 = g_ring[p0*2], l1 = g_ring[p1*2];
+            i32 r0 = g_ring[p0*2+1], r1 = g_ring[p1*2+1];
+            i32 L = l0 + (i32)(((i64)(l1 - l0) * (i64)fr) >> 16);
+            i32 R = r0 + (i32)(((i64)(r1 - r0) * (i64)fr) >> 16);
+            last = (ch == 1) ? (L + R) / 2 : L;
+            if (ch == 1) o[i] = (s16)last;
+            else {
+                o[i*ch] = (s16)L;
+                o[i*ch+1] = (s16)R;
+                for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)L;
+            }
+        } else if (rp + src < wf){
             u64 p = (rp + src) % RING_FRAMES;
             i32 L = g_ring[p*2], R = g_ring[p*2+1];
             last = (ch == 1) ? (L + R) / 2 : L;
@@ -267,6 +414,7 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     sp->frac = pos & 0xFFFF;
     sp->last = last;
     sp->rp = rp + (pos >> 16);
+    sp->pump += frames;
     if (outN) *outN = frames * fsz;
     g_subs++;
     return r;
@@ -288,6 +436,8 @@ u64 mc_capt(void){ return g_capt; }
 u64 mc_injc(void){ return g_injc; }
 u64 mc_subs(void){ return g_subs; }
 u64 mc_ch(void){ return g_ch; }
+u64 mc_caprate(void){ return g_caprate; }
+u64 mc_step(u64 i){ return i < g_stn ? g_st[i].step : 0; }
 u64 mc_rate(void){ return g_rate; }
 u64 mc_wf(void){ return g_wf; }
 /* 把环形缓冲的一段原样读出来，供外部核对 */
@@ -317,6 +467,8 @@ u64 mc_st(u64 i, u64 f){
         case 3: return p->rate;
         case 4: return p->ch;
         case 5: return (u64)sizeof(st_t);
+        case 6: return p->est;
+        case 7: return (u64)p->frac;
         default: return 0;
     }
 }
@@ -339,12 +491,27 @@ u64 mc_stn(void){ return g_stn; }
 u64 mc_avail(void){ return g_stn ? (g_wf > g_st[0].rp ? g_wf - g_st[0].rp : 0) : 0; }
 u64 mc_uidn(void){ return g_src ? 1 : 0; }
 void mc_set_target(u64 u){ g_target = u; }
-void mc_on(void){ g_stn = 0; g_src = 0; g_srctick = 0; g_on = 1; }
+void mc_setcaprate(u64 r){ if (r >= 8000 && r <= 192000) g_caprate = r; }
+void mc_setstart(u64 f){ g_rpstart1 = f + 1; }
+/* 生成测试音时独立指定生成速率，不受测量值影响 */
+/* 打开时只把已有流的读位置对齐到最新处，不清空流表。
+   清空会让正在录音的流重新起步，声音会断一下。 */
+void mc_on(void){
+    __asm__ volatile("dmb ish":::"memory");
+    u64 wf = g_wf;
+    for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; }
+    g_src = 0;
+    g_srctick = 0;
+    g_on = 1;
+}
 void mc_off(void){ g_on = 0; }
 void mc_reset(void){
     __asm__ volatile("dmb ish":::"memory");
-    g_stn = 0; g_src = 0; g_srctick = 0;
+    u64 wf = g_wf;
+    for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; }
+    g_src = 0; g_srctick = 0;
     g_capc = g_capt = g_injc = g_subs = 0;
+    g_capf0 = 0; g_capt0 = 0; g_capcand = 0; g_capvote = 0;
 }
 
 /* 在环形缓冲里放已知频率的正弦，用于验证取样换算 */
@@ -357,15 +524,21 @@ int mc_fillsine(u64 freq, u64 frames){
         -9512,-12540,-15447,-18205,-20788,-23170,-25330,-27246,-28899,-30274,
         -31357,-32138,-32610,-32767,-32610,-32138,-31357,-30274,-28899,-27246,
         -25330,-23170,-20788,-18205,-15447,-12540,-9512,-6393,-3212};
-    u64 step = (freq << 22) / 48000u;    /* 每帧推进的表内相位 */
+    /* 表里只有 64 个点，直接取整会让相邻帧落回同一个值。
+       按 16 位小数在表内插值。 */
+    u64 fr = g_caprate ? g_caprate : 48000u;
+    u64 step = ((freq * 64u) << 16) / fr;
     u64 ph = 0;
     for (u64 i = 0; i < frames; i++){
-        s16 v = tbl[(ph >> 16) % 64u];
+        u64 idx = (ph >> 16) & 63u;
+        u64 fr  = ph & 0xFFFFu;
+        i32 a = tbl[idx], b = tbl[(idx + 1) & 63u];
+        s16 v = (s16)(a + (i32)(((i64)(b - a) * (i64)fr) >> 16));
         ph += step;
         g_ring[i*2] = v; g_ring[i*2+1] = v;
     }
     __asm__ volatile("dmb ish":::"memory");
-    g_wf = frames; g_stn = 0;
+    g_wf = frames; g_stn = 0; g_rpstart1 = 1;
     return 0;
 }
 
@@ -388,6 +561,29 @@ static void mkentry(u64 entry, u64 handler){
     memw(entry, b, 16);
 }
 
+/* 影子入口：原函数开头 n 条指令（含落地点那条），再 br 回原函数第 n+1 条。
+   跳转落点必须是 bti 指令，所以覆盖区末尾补一条 bti c，
+   被它占掉的那条原指令改到影子入口里重放。 */
+static void mkshadow(u64 shadow, u64 base, const u32 *orig, int n){
+    u32 bti = 0xd503245fU;      /* bti c */
+    u32 ldr = 0x58000050U;      /* ldr x16, #8 */
+    u32 br  = 0xd61f0200U;      /* br x16 */
+    int slot = 4 + n*4;
+    u8 buf[128];
+    for (int i = 0; i < 128; i++) buf[i] = 0;
+    for (int k = 0; k < 4; k++) buf[k] = (u8)(bti >> (8*k));
+    reloc_fixup((u32 *)(buf + 4), shadow + 4, orig, base, n);
+    for (int k = 0; k < 4; k++) buf[slot+k]   = (u8)(ldr >> (8*k));
+    for (int k = 0; k < 4; k++) buf[slot+4+k] = (u8)(br  >> (8*k));
+    u64 back = base + (u64)(n-1) * 4;    /* 落地点：覆盖区最后一条的地址 */
+    for (int k = 0; k < 8; k++) buf[slot+8+k] = (u8)(back >> (8*k));
+    memw(shadow, buf, (u64)slot + 16);
+
+    u8 b4[4];
+    for (int k = 0; k < 4; k++) b4[k] = (u8)(bti >> (8*k));
+    memw(base + (u64)(n-1)*4, b4, 4);
+}
+
 int mc_install(u64 af, u64 hal){
     g_af = af; g_hal = hal;
 
@@ -398,19 +594,23 @@ int mc_install(u64 af, u64 hal){
         g_origok = 1;
     }
 
+    /* 采集入口前 5 条指令、注入入口从 +4 起 4 条指令，复制到影子入口 */
+    mkshadow(addr_shcap(), af + CAP_OFF, (const u32 *)g_corig, CAPN);
+    mkshadow(addr_shinj(), hal + INJ_OFF + 4, (const u32 *)g_iorig, INJN);
+
     {
         u64 h = addr_of_cap();
         u32 w[3] = {0xd50324dfu, 0x58000050u, 0xd61f0200u};
         for (int i = 0; i < 3; i++) for (int b = 0; b < 4; b++) g_cpatch[i*4+b] = (u8)(w[i] >> (8*b));
         for (int i = 0; i < 8; i++) g_cpatch[12+i] = (u8)(h >> (8*i));
-        memw(af + CAP_OFF, g_cpatch, CAPCOPY);
+        memw(af + CAP_OFF, g_cpatch, 20);
     }
     {
         u64 h = addr_of_inj();
         u32 w[2] = {0x58000050u, 0xd61f0200u};
         for (int i = 0; i < 2; i++) for (int b = 0; b < 4; b++) g_ipatch[i*4+b] = (u8)(w[i] >> (8*b));
         for (int i = 0; i < 8; i++) g_ipatch[8+i] = (u8)(h >> (8*i));
-        memw(hal + INJ_OFF + 4, g_ipatch, INJCOPY);
+        memw(hal + INJ_OFF + 4, g_ipatch, 16);
     }
     return 0;
 }
