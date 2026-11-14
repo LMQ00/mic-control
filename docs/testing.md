@@ -98,9 +98,28 @@ su -c '/data/data/com.lmq.miccontrol/files/mcinject status /data/misc/audioserve
 
 ## 命令行自测（开发用）
 
-需要一段可复现的录音。手机上没有独立的录音命令行工具，本方法仅记录验证时用过的做法。
+需要一段可复现的录音。这一步不需要放歌，工具自己往环形缓冲填一段 440 赫兹正弦。
 
-**核心判据**：录音数据按 32 位浮点解读。开关开着时，波形幅度（均方根）应显著高于关着时；实测开是 0.68、关是 0.0012，差约 570 倍。
+**执行什么**：
+
+```
+su -c '/data/data/com.lmq.miccontrol/files/mcinject on /data/misc/audioserver/libmcpayload.so 10383'
+su -c '/data/data/com.lmq.miccontrol/files/mcinject sine /data/misc/audioserver/libmcpayload.so 440 1000000 48000'
+su -c '/data/data/com.lmq.miccontrol/files/mcinject st /data/misc/audioserver/libmcpayload.so'
+```
+
+第三条输出每条录音流的速率、步长、声道和次数。步长应接近 1.0000。
+
+**核心判据**：录音数据按 32 位浮点解读。这一段实测：
+
+| 指标 | 实测值 |
+| --- | --- |
+| 有声段占全长 | 99.9% 以上 |
+| 波形幅度（均方根） | 0.706 |
+| 相邻样本相同（卡顿） | 0.0001 |
+| 按 44100 赫兹解读的音高 | 440.9 赫兹 |
+
+音高偏到 480 附近、相邻样本大量相同，都是重采样换算不对。
 
 ## 换了机型要重新求地址
 
