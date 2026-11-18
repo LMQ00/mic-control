@@ -129,20 +129,16 @@ __attribute__((visibility("hidden"))) static volatile u64 g_target;
 __attribute__((visibility("hidden"))) static volatile u32 g_on;
 __attribute__((visibility("hidden"))) static u64 g_capc, g_capt, g_injc, g_subs;
 __attribute__((visibility("hidden"))) static u64 g_ch, g_rate;
-__attribute__((visibility("hidden"))) static volatile u32 g_locks, g_lockc;
-static void lkc(void){ u32 v=1,st=1;
-    while(st){
-        __asm__ volatile("ldaxr %w0, [%1]":"=r"(v):"r"(&g_lockc):"memory");
-        if(v) continue;
-        __asm__ volatile("stxr %w0, %w2, [%1]":"=&r"(st):"r"(&g_lockc),"r"(v):"memory");
-    } }
-static void ulc(void){ __asm__ volatile("stlr wzr, [%0]"::"r"(&g_lockc):"memory"); }
-static void lk(void){ u32 v=1,st=1;
-    while(st){
-        __asm__ volatile("ldaxr %w0, [%1]":"=r"(v):"r"(&g_locks):"memory");
-        if(v) continue;
-        __asm__ volatile("stxr %w0, %w2, [%1]":"=&r"(st):"r"(&g_locks),"r"(v):"memory");
-    } }
+__attribute__((visibility("hidden"))) static volatile u32 g_locks;
+static void lk(void){
+    for (;;){
+        u32 v, st;
+        __asm__ volatile("ldaxr %w0, [%1]" : "=r"(v) : "r"(&g_locks) : "memory");
+        if (v){ __asm__ volatile("yield" ::: "memory"); continue; }
+        __asm__ volatile("stxr %w0, %w2, [%1]" : "=&r"(st) : "r"(&g_locks), "r"(1u) : "memory");
+        if (!st) return;
+    }
+}
 static void ul(void){ __asm__ volatile("stlr wzr, [%0]"::"r"(&g_locks):"memory"); }
 /* 采集源：只从一条音轨抄 */
 __attribute__((visibility("hidden"))) static volatile u64 g_src;
@@ -180,9 +176,9 @@ static inline u64 ns_diff(u64 a, u64 b){
 }
 
 /* step：每输出一帧要从环形缓冲吃掉多少帧，16 位小数。
-   pump：累计吃掉的帧数；pump0：上次校准时的值。 */
+   fixed：这条流用指定起点，第一块不套积压钳位。 */
 typedef struct { u64 self; u64 rp; u64 frac; u64 rate; u64 ch; u64 lastt; u64 cnt; i32 last;
-                 u64 step; u64 pump; u64 pump0; u64 avail0; u64 calt; u64 est; } st_t;
+                 u64 step; u64 fixed; } st_t;
 __attribute__((visibility("hidden"))) static st_t g_st[MAX_STREAMS];
 __attribute__((visibility("hidden"))) static u32 g_stn;
 
@@ -201,11 +197,7 @@ static void st_init(st_t *p, u64 self){
     p->cnt = 0;
     p->last = 0;
     p->step = 0;
-    p->pump = 0;
-    p->pump0 = 0;
-    p->avail0 = 0;
-    p->calt = 0;
-    p->est = 0;
+    p->fixed = start ? 1 : 0;
 }
 
 /* 流按对象地址认。地址会被后来的流复用：隔了 5 秒又出现的地址按新流重置。
@@ -249,12 +241,6 @@ static inline u32 popc(u32 x){
     while (x){ x &= x - 1; c++; }
     return c;
 }
-static inline s16 f2s(float x){
-    if (x >  1.0f) x =  1.0f;
-    if (x < -1.0f) x = -1.0f;
-    return (s16)(x * 32767.0f);
-}
-
 /* 采集：目标应用的播放复制进环形缓冲。 */
 __attribute__((used, noinline))
 i64 mc_cap_c(void *self, void *buf){
@@ -339,12 +325,10 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     st_t *sp = st_find((u64)self, t);
     if (!sp) return r;
 
-    /* 流对象里存着这条流的配置：0x40 格式、0x44 采样率、0x48 声道掩码。
+    /* 流对象里存着这条流的配置：0x44 采样率、0x48 声道掩码。
        声道数按掩码位数算，采样率直接用配置值。 */
-    u32 cfgt = *(u32 *)((u8 *)self + 0x40);
     u32 cfgr = *(u32 *)((u8 *)self + 0x44);
     u32 cfgn = *(u32 *)((u8 *)self + 0x48);
-    if (cfgt != 1) return r;            /* 只覆盖 16 位整数流 */
     u64 ch = popc(cfgn);
     if (ch < 1 || ch > 8) ch = 2;
     sp->ch = ch;
@@ -374,10 +358,11 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
 
     /* 缓冲里已有的数据超过允许的积压：退到积压上限。
        读位置越过写位置（旧流复用对象留下的）就贴住写位置。 */
-    if (!g_rpstart1 && wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
+    if (!sp->fixed && wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
         sp->rp = wf - MAX_BACKLOG;
     else if (sp->rp > wf)
         sp->rp = wf;
+    sp->fixed = 0;
 
     /* 步长 = 环形缓冲的写入速率 ÷ 这条流的采样率。
        缓冲写入速率随歌曲采样率变化，每次重算。 */
@@ -483,7 +468,7 @@ u64 mc_st(u64 i, u64 f){
         case 3: return p->rate;
         case 4: return p->ch;
         case 5: return (u64)sizeof(st_t);
-        case 6: return p->est;
+        case 6: return p->lastt;
         case 7: return (u64)p->frac;
         default: return 0;
     }
@@ -516,7 +501,9 @@ void mc_on(void){
     __asm__ volatile("dmb ish":::"memory");
     u64 wf = g_wf;
     u64 t = now_ns();
+    lk();
     for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; g_st[i].lastt = t; }
+    ul();
     g_src = 0;
     g_srctick = 0;
     g_on = 1;
@@ -525,7 +512,9 @@ void mc_off(void){ g_on = 0; }
 void mc_reset(void){
     __asm__ volatile("dmb ish":::"memory");
     u64 wf = g_wf;
+    lk();
     for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; }
+    ul();
     g_src = 0; g_srctick = 0;
     g_capc = g_capt = g_injc = g_subs = 0;
     g_capf0 = 0; g_capt0 = 0; g_capcand = 0; g_capvote = 0;
@@ -565,17 +554,6 @@ int mc_fillpat(u64 v, u64 frames){
     __asm__ volatile("dmb ish":::"memory");
     g_wf = frames; g_stn = 0;
     return 0;
-}
-
-/* 入口跳转：bti jc + ldr x16,#8 + br x16 + 处理器地址 */
-static void mkentry(u64 entry, u64 handler){
-    u8 b[16];
-    u32 jc = 0xd50324dfU, ldr = 0x58000050u, br = 0xd61f0200u;
-    for (int k = 0; k < 4; k++) b[k] = (u8)(jc >> (8*k));
-    for (int k = 0; k < 4; k++) b[4+k] = (u8)(ldr >> (8*k));
-    for (int k = 0; k < 4; k++) b[8+k] = (u8)(br >> (8*k));
-    for (int k = 0; k < 8; k++) b[12+k] = (u8)(handler >> (8*k));
-    memw(entry, b, 16);
 }
 
 /* 影子入口：原函数开头 n 条指令（含落地点那条），再 br 回原函数第 n+1 条。
