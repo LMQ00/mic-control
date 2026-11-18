@@ -108,7 +108,7 @@ su -c '/data/data/com.lmq.miccontrol/files/mcinject sine /data/misc/audioserver/
 su -c '/data/data/com.lmq.miccontrol/files/mcinject st /data/misc/audioserver/libmcpayload.so'
 ```
 
-第三条输出每条录音流的速率、步长、声道和次数。48000 赫兹的流步长 1.0000，16000 赫兹的流步长 3.0000。
+第三条输出每条录音流的速率、步长、声道和次数。缓冲写入速率为 48000 时，48000 赫兹的流步长 1.0000，16000 赫兹的流步长 3.0000。
 
 **核心判据**：用系统录音机录 6 秒，导出录音，按 16 位整数、48000 赫兹解读。这一段实测：
 
@@ -119,7 +119,7 @@ su -c '/data/data/com.lmq.miccontrol/files/mcinject st /data/misc/audioserver/li
 | 左右声道是否一致 | 一致 |
 | 声服务里的帧字节 | 4（立体声） |
 
-音高对不上、波形里全是高频杂音，都算不通过。
+通过时波形是单一频率的正弦，音高与填入的频率一致。
 
 ## 换了机型要重新求地址
 

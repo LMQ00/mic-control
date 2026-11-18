@@ -190,11 +190,13 @@ __attribute__((visibility("hidden"))) static u32 g_stn;
    新流取这段的起点，既不会读空，也不会落后太多。 */
 static void st_init(st_t *p, u64 self){
     u64 wf = g_wf;
+    u64 start = g_rpstart1;
     p->self = self;
-    p->rp = g_rpstart1 ? g_rpstart1 - 1 : (wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0);
+    p->rp = start ? start - 1 : (wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0);
+    if (start) g_rpstart1 = 0;      /* 指定起点只给下一条新流用一次 */
     p->frac = 0;
     p->rate = 48000;
-    p->ch = 1;
+    p->ch = 2;
     p->lastt = 0;
     p->cnt = 0;
     p->last = 0;
@@ -207,21 +209,25 @@ static void st_init(st_t *p, u64 self){
 }
 
 /* 流按对象地址认。地址会被后来的流复用：隔了 5 秒又出现的地址按新流重置。
-   表满了就顶掉最久没被调用的那条，新录音不会因为表满而拿不到声音。 */
+   表满了只回收 5 秒没被调用的条目；没有可回收的就放弃这条流，不碰正在用的。 */
+#define STALE_NS 5000000000ULL
 static st_t* st_find(u64 self, u64 now){
+    st_t *r = 0;
+    lk();
     for (u32 i = 0; i < g_stn; i++) if (g_st[i].self == self){
-        st_t *p = &g_st[i];
-        if (p->lastt && ns_diff(now, p->lastt) > 5000000000ULL) st_init(p, self);
-        return p;
+        r = &g_st[i];
+        if (r->lastt && ns_diff(now, r->lastt) > STALE_NS) st_init(r, self);
+        break;
     }
-    st_t *p;
-    if (g_stn < MAX_STREAMS) p = &g_st[g_stn++];
-    else {
-        p = &g_st[0];
-        for (u32 i = 1; i < g_stn; i++) if (g_st[i].lastt < p->lastt) p = &g_st[i];
+    if (!r){
+        if (g_stn < MAX_STREAMS) r = &g_st[g_stn++];
+        else for (u32 i = 0; i < g_stn; i++)
+            if (g_st[i].lastt && ns_diff(now, g_st[i].lastt) > STALE_NS &&
+                (!r || g_st[i].lastt < r->lastt)) r = &g_st[i];
+        if (r) st_init(r, self);
     }
-    st_init(p, self);
-    return p;
+    ul();
+    return r;
 }
 
 static void flushc(u64 a, u64 n){
@@ -325,52 +331,57 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     g_injc++;
     if (r != 0 || !self || !buf || !bytes || !g_on) return r;
 
+    /* 原函数写回的实际字节数；拿不到时按请求长度算。 */
+    u64 got = bytes;
+    if (outN && *outN < bytes) got = *outN;
+
     u64 t = now_ns();
     st_t *sp = st_find((u64)self, t);
     if (!sp) return r;
 
     /* 流对象里存着这条流的配置：0x40 格式、0x44 采样率、0x48 声道掩码。
-       按掩码位数算声道数，按采样率算步长；两个值都由系统填好，不用猜。 */
+       声道数按掩码位数算，采样率直接用配置值。 */
+    u32 cfgt = *(u32 *)((u8 *)self + 0x40);
     u32 cfgr = *(u32 *)((u8 *)self + 0x44);
     u32 cfgn = *(u32 *)((u8 *)self + 0x48);
+    if (cfgt != 1) return r;            /* 只覆盖 16 位整数流 */
     u64 ch = popc(cfgn);
-    if (ch < 1 || ch > 8) ch = sp->ch;
+    if (ch < 1 || ch > 8) ch = 2;
     sp->ch = ch;
     g_ch = ch;
-    if (cfgr >= 8000 && cfgr <= 192000 && sp->rate != cfgr){
-        sp->rate = cfgr;
-        sp->step = 0;
-    }
+    if (cfgr >= 8000 && cfgr <= 192000) sp->rate = cfgr;
 
     u64 fsz = 2 * ch;
-    u64 frames = bytes / fsz;
-    if (!frames) return r;
-
+    u64 frames = got / fsz;
     sp->lastt = t;
     sp->cnt++;
+    if (!frames) return r;
 
     s16 *o = (s16 *)buf;
     u64 wf = g_wf;
-    g_lastbytes = bytes; g_lastframes = frames; g_lastfsz = fsz;
+    g_lastbytes = got; g_lastframes = frames; g_lastfsz = fsz;
+
+    /* 不属于整帧的尾巴清零，不留原始麦克风数据 */
+    for (u64 k = frames * ch; k < bytes / 2; k++) o[k] = 0;
 
     /* 还没抄到音乐：输出静音 */
     if (wf < 2){
-        for (u64 i = 0; i < bytes / 2; i++) o[i] = 0;
-        if (outN) *outN = bytes;
+        for (u64 k = 0; k < frames * ch; k++) o[k] = 0;
+        if (outN) *outN = frames * fsz;
         g_subs++;
         return r;
     }
 
-    /* 读位置掉到写位置后面（缓冲里已有的数据比允许的积压多）：退到积压上限。
-       读位置被用过头的（旧流复用对象）也在这里拉回来。 */
+    /* 缓冲里已有的数据超过允许的积压：退到积压上限。
+       读位置越过写位置（旧流复用对象留下的）就贴住写位置。 */
     if (!g_rpstart1 && wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
         sp->rp = wf - MAX_BACKLOG;
     else if (sp->rp > wf)
-        sp->rp = wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0;
+        sp->rp = wf;
 
     /* 步长 = 环形缓冲的写入速率 ÷ 这条流的采样率。
-       采样率取自流对象里的配置，两个量都不用猜。 */
-    if (!sp->step){
+       缓冲写入速率随歌曲采样率变化，每次重算。 */
+    {
         u64 sr = sp->rate;
         sp->step = sr ? (g_caprate << 16) / sr : 0x10000;
     }
@@ -386,32 +397,26 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     for (; i < frames; i++){
         u64 src = pos >> 16;
         u64 fr = pos & 0xFFFF;
+        i32 L, R;
         if (rp + src + 1 < wf){
             u64 p0 = (rp + src) % RING_FRAMES, p1 = (rp + src + 1) % RING_FRAMES;
             /* 相邻两点线性插值。直接取整会让波形出锯齿，听着发毛。 */
             i32 l0 = g_ring[p0*2], l1 = g_ring[p1*2];
             i32 r0 = g_ring[p0*2+1], r1 = g_ring[p1*2+1];
-            i32 L = l0 + (i32)(((i64)(l1 - l0) * (i64)fr) >> 16);
-            i32 R = r0 + (i32)(((i64)(r1 - r0) * (i64)fr) >> 16);
-            last = (ch == 1) ? (L + R) / 2 : L;
-            if (ch == 1) o[i] = (s16)last;
-            else {
-                o[i*ch] = (s16)L;
-                o[i*ch+1] = (s16)R;
-                for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)L;
-            }
+            L = l0 + (i32)(((i64)(l1 - l0) * (i64)fr) >> 16);
+            R = r0 + (i32)(((i64)(r1 - r0) * (i64)fr) >> 16);
         } else if (rp + src < wf){
             u64 p = (rp + src) % RING_FRAMES;
-            i32 L = g_ring[p*2], R = g_ring[p*2+1];
-            last = (ch == 1) ? (L + R) / 2 : L;
-            if (ch == 1) o[i] = (s16)last;
-            else {
-                o[i*ch] = (s16)L;
-                o[i*ch+1] = (s16)R;
-                for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)L;
-            }
+            L = g_ring[p*2]; R = g_ring[p*2+1];
         } else {
             break;
+        }
+        last = (ch == 1) ? (L + R) / 2 : L;
+        if (ch == 1) o[i] = (s16)last;
+        else {
+            o[i*ch] = (s16)L;
+            o[i*ch+1] = (s16)R;
+            for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)((c & 1) ? R : L);
         }
         pos += step;
     }
@@ -425,7 +430,7 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     sp->frac = pos & 0xFFFF;
     sp->last = last;
     sp->rp = rp + (pos >> 16);
-    sp->pump += frames;
+    if (sp->rp > wf) sp->rp = wf;
     if (outN) *outN = frames * fsz;
     g_subs++;
     return r;
@@ -510,7 +515,8 @@ void mc_setstart(u64 f){ g_rpstart1 = f + 1; }
 void mc_on(void){
     __asm__ volatile("dmb ish":::"memory");
     u64 wf = g_wf;
-    for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; }
+    u64 t = now_ns();
+    for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; g_st[i].lastt = t; }
     g_src = 0;
     g_srctick = 0;
     g_on = 1;
