@@ -218,6 +218,7 @@ static st_t* st_find(u64 self, u64 now){
                 (!r || g_st[i].lastt < r->lastt)) r = &g_st[i];
         if (r) st_init(r, self);
     }
+    if (r) r->lastt = now;
     ul();
     return r;
 }
@@ -358,11 +359,13 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
 
     /* 缓冲里已有的数据超过允许的积压：退到积压上限。
        读位置越过写位置（旧流复用对象留下的）就贴住写位置。 */
-    if (!sp->fixed && wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
+    if (sp->fixed){
+        /* 指定起点一直有效，直到积压回到上限以内 */
+        if (wf <= sp->rp || wf - sp->rp <= MAX_BACKLOG) sp->fixed = 0;
+    } else if (wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
         sp->rp = wf - MAX_BACKLOG;
     else if (sp->rp > wf)
         sp->rp = wf;
-    sp->fixed = 0;
 
     /* 步长 = 环形缓冲的写入速率 ÷ 这条流的采样率。
        缓冲写入速率随歌曲采样率变化，每次重算。 */
@@ -544,7 +547,7 @@ int mc_fillsine(u64 freq, u64 frames){
         g_ring[i*2] = v; g_ring[i*2+1] = v;
     }
     __asm__ volatile("dmb ish":::"memory");
-    g_wf = frames; g_stn = 0; g_rpstart1 = 1;
+    lk(); g_wf = frames; g_stn = 0; g_rpstart1 = 1; ul();
     return 0;
 }
 
@@ -552,7 +555,7 @@ int mc_fillpat(u64 v, u64 frames){
     if (frames > RING_FRAMES) frames = RING_FRAMES;
     for (u64 i = 0; i < frames; i++){ g_ring[i*2] = (s16)v; g_ring[i*2+1] = (s16)v; }
     __asm__ volatile("dmb ish":::"memory");
-    g_wf = frames; g_stn = 0;
+    lk(); g_wf = frames; g_stn = 0; ul();
     return 0;
 }
 

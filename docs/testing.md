@@ -117,7 +117,7 @@ su -c '/data/data/com.lmq.miccontrol/files/mcinject st /data/misc/audioserver/li
 | 音高 | 440 赫兹 |
 | 波形幅度（均方根） | 0.70 |
 | 左右声道是否一致 | 一致 |
-| 声服务里的帧字节 | 4（立体声） |
+| 声道数（`mcinject st` 的声道列） | 2 |
 
 通过时波形是单一频率的正弦，音高与填入的频率一致。
 
