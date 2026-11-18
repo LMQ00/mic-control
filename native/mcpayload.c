@@ -188,10 +188,7 @@ __attribute__((visibility("hidden"))) static u32 g_stn;
 
 /* 新流从“最旧可用数据”开始读。缓冲里最多留 200 毫秒的积压，
    新流取这段的起点，既不会读空，也不会落后太多。 */
-static st_t* st_find(u64 self){
-    for (u32 i = 0; i < g_stn; i++) if (g_st[i].self == self) return &g_st[i];
-    if (g_stn >= MAX_STREAMS) return 0;
-    st_t *p = &g_st[g_stn++];
+static void st_init(st_t *p, u64 self){
     u64 wf = g_wf;
     p->self = self;
     p->rp = g_rpstart1 ? g_rpstart1 - 1 : (wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0);
@@ -207,6 +204,23 @@ static st_t* st_find(u64 self){
     p->avail0 = 0;
     p->calt = 0;
     p->est = 0;
+}
+
+/* 流按对象地址认。地址会被后来的流复用：隔了 5 秒又出现的地址按新流重置。
+   表满了就顶掉最久没被调用的那条，新录音不会因为表满而拿不到声音。 */
+static st_t* st_find(u64 self, u64 now){
+    for (u32 i = 0; i < g_stn; i++) if (g_st[i].self == self){
+        st_t *p = &g_st[i];
+        if (p->lastt && ns_diff(now, p->lastt) > 5000000000ULL) st_init(p, self);
+        return p;
+    }
+    st_t *p;
+    if (g_stn < MAX_STREAMS) p = &g_st[g_stn++];
+    else {
+        p = &g_st[0];
+        for (u32 i = 1; i < g_stn; i++) if (g_st[i].lastt < p->lastt) p = &g_st[i];
+    }
+    st_init(p, self);
     return p;
 }
 
@@ -222,6 +236,12 @@ static void memw(u64 a, const void *d, u64 n){
     if (g_mem < 0) g_mem = sy(SYS_openat, AT_FDCWD, (i64)"/proc/self/mem", 2, 0, 0, 0);
     if (g_mem >= 0) sy(SYS_pwrite64, g_mem, (i64)d, (i64)n, (i64)a, 0, 0);
     flushc(a, n);
+}
+/* 数声道掩码里有几位，得到声道数。 */
+static inline u32 popc(u32 x){
+    u32 c = 0;
+    while (x){ x &= x - 1; c++; }
+    return c;
 }
 static inline s16 f2s(float x){
     if (x >  1.0f) x =  1.0f;
@@ -305,25 +325,29 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     g_injc++;
     if (r != 0 || !self || !buf || !bytes || !g_on) return r;
 
-    st_t *sp = st_find((u64)self);
+    u64 t = now_ns();
+    st_t *sp = st_find((u64)self, t);
     if (!sp) return r;
 
-    /* 采样率和声道数按流各自记住。系统里同时有 16000 和 48000 的流，
-       共用一个全局值会让后调用的流把前者的参数覆盖掉。 */
-    u64 ch = *(u32 *)((u8 *)self + 0x4c);
+    /* 流对象里存着这条流的配置：0x40 格式、0x44 采样率、0x48 声道掩码。
+       按掩码位数算声道数，按采样率算步长；两个值都由系统填好，不用猜。 */
+    u32 cfgr = *(u32 *)((u8 *)self + 0x44);
+    u32 cfgn = *(u32 *)((u8 *)self + 0x48);
+    u64 ch = popc(cfgn);
     if (ch < 1 || ch > 8) ch = sp->ch;
     sp->ch = ch;
     g_ch = ch;
+    if (cfgr >= 8000 && cfgr <= 192000 && sp->rate != cfgr){
+        sp->rate = cfgr;
+        sp->step = 0;
+    }
 
     u64 fsz = 2 * ch;
     u64 frames = bytes / fsz;
     if (!frames) return r;
 
-    u64 t = now_ns();
     sp->lastt = t;
     sp->cnt++;
-    u64 rate = sp->rate;
-    g_rate = rate;
 
     s16 *o = (s16 *)buf;
     u64 wf = g_wf;
@@ -337,48 +361,29 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
         return r;
     }
 
+    /* 读位置掉到写位置后面（缓冲里已有的数据比允许的积压多）：退到积压上限。
+       读位置被用过头的（旧流复用对象）也在这里拉回来。 */
     if (!g_rpstart1 && wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
         sp->rp = wf - MAX_BACKLOG;
+    else if (sp->rp > wf)
+        sp->rp = wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0;
 
-    /* 步长直接量：看环形缓冲的积压怎么变。
-       积压涨了说明吃得太慢，步长要加大；跌了说明吃得太快。
-       量出来的步长不依赖任何采样率字段，也不会被采样率估算的误差带偏。 */
-    /* 步长按“这条流每秒要吃多少帧”定。
-       采集每抄一帧前进一帧，所以环形缓冲里 1 秒正好是 g_caprate 帧。
-       这条流 1 秒交付多少帧，用累计交付帧数除以时间直接算，
-       不读采样率字段，也不受采样率猜错的影响。 */
-    /* 步长 = 环形缓冲速率 ÷ 这条流每秒交付的帧数，再乘 HAL 的换算系数。
-       HAL 自称的采样率和它实际消耗的速率差一个固定比例，
-       这个比例在 device 上量出来是 1.0897（48000/44100 的倒数）。 */
-    {
-        if (!sp->step){
-            u64 sr = rate;
-            sp->step = sr ? (g_caprate << 16) / sr : 0x10000;
-            sp->calt = t; sp->pump0 = sp->pump;
-        } else if (ns_diff(t, sp->calt) >= 2000000000ULL){
-            u64 dp = sp->pump - sp->pump0;
-            u64 dt = ns_diff(t, sp->calt);
-            if (dp > 8192 && dt){
-                u64 sr = dp * 1000000000ULL / dt;
-                if (sr >= 8000 && sr <= 192000){
-                    /* 两次相隔不到 1% 才采纳，单次抖动不带进来 */
-                    if (sp->est && sr + sr/100 > sp->est && sr - sr/100 < sp->est){
-                        sp->rate = sr;
-                        sp->step = (g_caprate << 16) / sr;
-                    }
-                    sp->est = sr;
-                }
-            }
-            sp->pump0 = sp->pump; sp->calt = t;
-        }
+    /* 步长 = 环形缓冲的写入速率 ÷ 这条流的采样率。
+       采样率取自流对象里的配置，两个量都不用猜。 */
+    if (!sp->step){
+        u64 sr = sp->rate;
+        sp->step = sr ? (g_caprate << 16) / sr : 0x10000;
     }
 
+    u64 rate = sp->rate;
+    g_rate = rate;
     u64 rp = sp->rp;
     u64 step = sp->step;
     u64 pos = sp->frac;
     i32 last = sp->last;
 
-    for (u64 i = 0; i < frames; i++){
+    u64 i = 0;
+    for (; i < frames; i++){
         u64 src = pos >> 16;
         u64 fr = pos & 0xFFFF;
         if (rp + src + 1 < wf){
@@ -406,10 +411,16 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
                 for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)L;
             }
         } else {
-            if (ch == 1) o[i] = (s16)last;
-            else for (u64 c = 0; c < ch; c++) o[i*ch+c] = (s16)last;
+            break;
         }
         pos += step;
+    }
+
+    /* 缓冲里没数据了：这一段输出静音，读位置停在已有数据的末尾。
+       数据再写进来时从这里接着播，读位置不会被这段静音甩到前面去。 */
+    for (; i < frames; i++){
+        if (ch == 1) o[i] = 0;
+        else for (u64 c = 0; c < ch; c++) o[i*ch+c] = 0;
     }
     sp->frac = pos & 0xFFFF;
     sp->last = last;
