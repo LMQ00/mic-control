@@ -136,11 +136,11 @@ private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
             }
             busy = false
             message = result.getOrElse { "操作没成功：${it.message}" }
-            // 失败就把开关退回原状态，避免界面显示"开着"实际没开
+            // 失败就退回拨动前的状态，避免界面显示的和实际不一致
             if (result.isFailure) {
-                enabled = false
-                store.enabled = false
-                ControlNotification.cancel(context)
+                enabled = !on
+                store.enabled = !on
+                if (on) ControlNotification.cancel(context) else ControlNotification.show(context)
             }
         }
     }

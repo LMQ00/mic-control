@@ -32,15 +32,15 @@ class ToggleReceiver : BroadcastReceiver() {
             try {
                 if (want) {
                     val uid = store.uidOf(store.musicPackage)
-                    if (uid != null) {
-                        injector.enable(uid)
-                    } else {
-                        // 没选应用就开不了，把状态退回关闭，避免界面与实况不符
+                    // 打不开就退回关闭，避免通知栏显示"开着"实际没开
+                    if (uid == null || injector.enable(uid).isFailure) {
                         store.enabled = false
                         ControlNotification.show(context)
                     }
-                } else {
-                    injector.disable()
+                } else if (injector.disable().isFailure) {
+                    // 关不掉就退回开启，避免通知栏显示"关着"实际还在替换麦克风
+                    store.enabled = true
+                    ControlNotification.show(context)
                 }
             } finally {
                 pending.finish()

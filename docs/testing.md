@@ -40,8 +40,11 @@
 **执行什么**：
 
 ```
-su -c '/data/data/com.lmq.miccontrol/files/mcinject status /data/misc/audioserver/libmcpayload.so'
+P=$(su -c 'ls -t /data/misc/audioserver/libmcpayload-*.so | head -1')
+su -c "/data/data/com.lmq.miccontrol/files/mcinject status $P"
 ```
+
+第一行取的是最新落盘的那份载荷。载荷按内容命名，界面上打开过一次开关后这个名字才会出现。升级前留下的 `libmcpayload.so` 会一直留在目录里，命令取的是新名字那份。
 
 **看到什么算成功**：输出形如「启用中 采集=… 注入=… 音轨=…」。
 
@@ -103,9 +106,10 @@ su -c '/data/data/com.lmq.miccontrol/files/mcinject status /data/misc/audioserve
 **执行什么**：
 
 ```
-su -c '/data/data/com.lmq.miccontrol/files/mcinject on /data/misc/audioserver/libmcpayload.so 10383'
-su -c '/data/data/com.lmq.miccontrol/files/mcinject sine /data/misc/audioserver/libmcpayload.so 440 1000000 48000'
-su -c '/data/data/com.lmq.miccontrol/files/mcinject st /data/misc/audioserver/libmcpayload.so'
+P=$(su -c 'ls -t /data/misc/audioserver/libmcpayload-*.so | head -1')
+su -c "/data/data/com.lmq.miccontrol/files/mcinject on $P 10383"
+su -c "/data/data/com.lmq.miccontrol/files/mcinject sine $P 440 1000000 48000"
+su -c "/data/data/com.lmq.miccontrol/files/mcinject st $P"
 ```
 
 第三条输出每条录音流的速率、步长、声道和次数。缓冲写入速率为 48000 时，48000 赫兹的流步长 1.0000，16000 赫兹的流步长 3.0000。

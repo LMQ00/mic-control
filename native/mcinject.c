@@ -98,14 +98,24 @@ static uint64_t esym(const char *path, const char *name) {
     close(fd);
     Elf64_Ehdr *eh = m;
     uint64_t out = 0;
-    if (!memcmp(eh->e_ident, ELFMAG, 4)) {
+    /* 文件可能被截断，一切偏移都先对照文件长度检查 */
+    if (!memcmp(eh->e_ident, ELFMAG, 4) && eh->e_shentsize == sizeof(Elf64_Shdr) &&
+        eh->e_shoff >= sizeof(Elf64_Ehdr) && eh->e_shnum > 0 &&
+        (uint64_t)eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr) <= (uint64_t)sz) {
         Elf64_Shdr *sh = (void *)((char *)m + eh->e_shoff);
         for (int i = 0; i < eh->e_shnum && !out; i++) {
             if (sh[i].sh_type != SHT_DYNSYM) continue;
+            if (sh[i].sh_link >= (uint64_t)eh->e_shnum) continue;
+            Elf64_Shdr *stsh = &sh[sh[i].sh_link];
+            if (sh[i].sh_offset > (uint64_t)sz || sh[i].sh_size > (uint64_t)sz - sh[i].sh_offset) continue;
+            if (stsh->sh_offset > (uint64_t)sz || stsh->sh_size > (uint64_t)sz - stsh->sh_offset) continue;
             Elf64_Sym *sy = (void *)((char *)m + sh[i].sh_offset);
-            char *st = (char *)m + sh[sh[i].sh_link].sh_offset;
+            char *st = (char *)m + stsh->sh_offset;
             for (size_t j = 0; j < sh[i].sh_size / sizeof(Elf64_Sym); j++) {
-                if (!sy[j].st_name || sy[j].st_shndx == SHN_UNDEF) continue;
+                if (!sy[j].st_name || sy[j].st_name >= stsh->sh_size) continue;
+                size_t lim = stsh->sh_size - sy[j].st_name;
+                if (strnlen(st + sy[j].st_name, lim) >= lim) continue;
+                if (sy[j].st_shndx == SHN_UNDEF) continue;
                 if (!strcmp(st + sy[j].st_name, name)) { out = sy[j].st_value; break; }
             }
         }
@@ -259,6 +269,87 @@ static int already_loaded(const char *payload) {
     return maps_find(bn, &pb, pp, sizeof pp) == 0;
 }
 
+static int hooks_present(void);
+
+/* 声音进程里映射着的载荷库：基址 + 文件路径。 */
+typedef struct { uint64_t base; char path[512]; } load_t;
+#define MAX_LOADS 16
+
+/* 从 maps 文本里收载荷的映射。同一个文件的几段只留第一段，
+   第一段的起点就是装载基址。 */
+static int loads_parse(FILE *f, load_t *out, int max) {
+    int n = 0;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *sl = strchr(line, '/');
+        if (!sl || !strstr(sl, "libmcpayload")) continue;
+        char *nl = strchr(sl, '\n');
+        if (nl) *nl = 0;
+        char *dl = strstr(sl, " (deleted)");
+        if (dl) *dl = 0;
+        size_t l = strlen(sl);
+        if (l < 4 || strcmp(sl + l - 3, ".so")) continue;
+        if (l >= sizeof out[0].path) continue;          /* 超长路径不截断着用 */
+        const char *bn = strrchr(sl, '/');
+        if (strncmp(bn ? bn + 1 : sl, "libmcpayload", 12)) continue;
+        int dup = 0;
+        for (int i = 0; i < n; i++) if (!strcmp(out[i].path, sl)) { dup = 1; break; }
+        if (dup) continue;
+        if (n >= max) { fprintf(stderr, "载荷映射超过 %d 份，只认前 %d 份\n", max, max); break; }
+        uint64_t b = 0;
+        sscanf(line, "%lx-", &b);
+        if (!b) continue;               /* 截断的残行，别当成映射 */
+        out[n].base = b;
+        snprintf(out[n].path, sizeof out[n].path, "%s", sl);
+        n++;
+    }
+    return n;
+}
+
+static int loads_scan(load_t *out, int max) {
+    char mp[64];
+    snprintf(mp, sizeof mp, "/proc/%d/maps", g_pid);
+    FILE *f = fopen(mp, "r");
+    if (!f) return -1;
+    int n = loads_parse(f, out, max);
+    fclose(f);
+    return n;
+}
+
+/* 固定文件名的那份是旧版本装的。它映射的文件已经被新版本覆盖，
+   文件里的符号地址对不上内存里跑的代码。 */
+static int plain_name(const char *path) {
+    const char *bn = strrchr(path, '/');
+    return !strcmp(bn ? bn + 1 : path, "libmcpayload.so");
+}
+
+/* 参数是不是一份载荷路径。命令里可以传占位符，这时按实际映射的那份取数。 */
+static int payload_path(const char *path) {
+    const char *bn = strrchr(path, '/');
+    return !strncmp(bn ? bn + 1 : path, "libmcpayload", 12);
+}
+
+/* 卸掉声音进程里装着的其他载荷。keep 是本次要用的那份，由调用者先卸。
+   载荷文件名带内容标记，映射的文件不会被覆盖，符号按各自的文件解析。 */
+static int uninstall_loaded(const char *keep) {
+    load_t ls[MAX_LOADS];
+    int n = loads_scan(ls, MAX_LOADS);
+    if (n < 0) { fprintf(stderr, "读不到声音进程的内存映射\n"); return 1; }
+    const char *old = 0, *lost = 0;
+    for (int i = 0; i < n; i++) {
+        if (keep && !strcmp(ls[i].path, keep)) continue;
+        uint64_t un = plain_name(ls[i].path) ? 0 : esym(ls[i].path, "mc_uninstall");
+        if (un) { call2(ls[i].base + un, 0, 0); continue; }
+        if (plain_name(ls[i].path)) old = ls[i].path; else lost = ls[i].path;
+    }
+    /* 卸不掉的载荷还挂着钩子时，只能靠重启声音进程清掉 */
+    if (!hooks_present()) return 0;
+    if (old) fprintf(stderr, "声音进程里还装着旧版的载荷，重启手机后再操作\n");
+    else if (lost) fprintf(stderr, "载荷文件 %s 不在了，重启手机后再操作\n", lost);
+    else fprintf(stderr, "声音进程里的钩子还装着，重启手机后再操作\n");
+    return 1;
+}
+
 static int cmd_on(const char *payload, uint64_t target) {
     g_pid = find_proc(NULL);
     if (g_pid <= 0) { fprintf(stderr, "系统声音进程没在跑\n"); return 1; }
@@ -270,36 +361,36 @@ static int cmd_on(const char *payload, uint64_t target) {
 
     if (do_attach()) { do_detach(); return 1; }
 
-    /* 已经装过就先卸掉，保证重复执行结果一致 */
+    /* 当前载荷装着钩子就先卸掉，保证重复执行结果一致 */
     char pp[512] = {0};
     if (already_loaded(payload)) {
         uint64_t un = psym(payload, "mc_uninstall", pp, sizeof pp);
         if (un) call2(un, 0, 0);
-    } else {
-        if (load_payload(payload, pp, sizeof pp)) { do_detach(); return 1; }
+    }
+    /* 再清掉其他版本装着的载荷：它们的钩子留着会被当成原指令存下来 */
+    if (uninstall_loaded(payload)) { do_detach(); return 1; }
+    if (!already_loaded(payload) && load_payload(payload, pp, sizeof pp)) {
+        do_detach();
+        return 1;
     }
 
     uint64_t f_install = psym(payload, "mc_install", pp, sizeof pp);
-    uint64_t f_hcap = psym(payload, "mc_h_cap", pp, sizeof pp);
-    uint64_t f_hinj = psym(payload, "mc_h_inj", pp, sizeof pp);
     uint64_t f_target = psym(payload, "mc_set_target", pp, sizeof pp);
     uint64_t f_on = psym(payload, "mc_on", pp, sizeof pp);
-    if (!f_install || !f_hcap || !f_hinj || !f_target || !f_on) {
+    if (!f_install || !f_target || !f_on) {
         fprintf(stderr, "载荷里缺少需要的符号\n");
         do_detach();
         return 1;
     }
 
-    uint64_t hcap = call2(f_hcap, 0, 0);
-    uint64_t hinj = call2(f_hinj, 0, 0);
-    uint64_t rc = call4(f_install, af, hal, hcap, hinj);
-    uint64_t f_diag = psym(payload, "mc_diag", pp, sizeof pp);
-    if (f_diag) {
-        fprintf(stderr, "诊断：fd=%lld 影子=%#llx 影首=%#llx 入首=%#llx\n",
-            (long long)call2(f_diag, 0, 0), (unsigned long long)call2(f_diag, 1, 0),
-            (unsigned long long)call2(f_diag, 2, 0), (unsigned long long)call2(f_diag, 3, 0));
+    uint64_t rc = call2(f_install, af, hal);
+    if ((long)rc != 0) {
+        fprintf(stderr, "装跳板失败：%ld\n", (long)rc);
+        fprintf(stderr, "载荷=%s 采集=%#llx 注入=%#llx\n",
+                payload, (unsigned long long)af, (unsigned long long)hal);
+        do_detach();
+        return 1;
     }
-    if ((long)rc != 0) { fprintf(stderr, "装跳板失败：%ld\n", (long)rc); do_detach(); return 1; }
     call2(f_target, target, 0);
     call2(f_on, 0, 0);
 
@@ -323,14 +414,17 @@ static int cmd_on(const char *payload, uint64_t target) {
 }
 
 static int cmd_off(const char *payload) {
+    (void)payload;
     g_pid = find_proc(NULL);
     if (g_pid <= 0) { printf("系统声音进程没在跑，无需操作\n"); return 0; }
-    if (!already_loaded(payload)) { printf("没有装过\n"); return 0; }
+    load_t ls[MAX_LOADS];
+    int n = loads_scan(ls, MAX_LOADS);
+    if (n < 0) { fprintf(stderr, "读不到声音进程的内存映射\n"); return 1; }
+    if (!n) { printf("没有装过\n"); return 0; }
     if (do_attach()) { do_detach(); return 1; }
-    uint64_t un = psym(payload, "mc_uninstall", NULL, 0);
-    if (!un) { fprintf(stderr, "载荷里缺少卸载函数\n"); do_detach(); return 1; }
-    call2(un, 0, 0);
+    int rc = uninstall_loaded(NULL);
     do_detach();
+    if (rc) return 1;
     printf("已关闭\n");
     return 0;
 }
@@ -401,30 +495,32 @@ static int cmd_status(const char *payload) {
     if (g_pid <= 0) { printf("未启用（声音服务没在跑）\n"); return 0; }
     if (do_attach()) { do_detach(); return 1; }
     int on = hooks_present();
+    /* 只按带内容标记的那份取数：旧版固定名的文件已被覆盖，符号对不上内存里的代码 */
+    const char *lib = 0;
+    if (payload_path(payload) && already_loaded(payload) && !plain_name(payload)) lib = payload;
+    load_t ls[MAX_LOADS];
+    int n = loads_scan(ls, MAX_LOADS);
+    for (int i = 0; !lib && i < n; i++) if (!plain_name(ls[i].path)) lib = ls[i].path;
+
     uint64_t cap = 0, sub = 0, uid = 0;
-    if (on && already_loaded(payload)) {
-        uint64_t f_cap = psym(payload, "mc_capt", NULL, 0);
-        uint64_t f_sub = psym(payload, "mc_subs", NULL, 0);
-        uint64_t f_uid = psym(payload, "mc_uidn", NULL, 0);
+    uint64_t rate = 0, cr = 0, lb = 0, lf = 0, lfs = 0, av = 0, wf = 0;
+    if (on && lib) {
+        uint64_t f_cap = psym(lib, "mc_capt", NULL, 0);
+        uint64_t f_sub = psym(lib, "mc_subs", NULL, 0);
+        uint64_t f_uid = psym(lib, "mc_uidn", NULL, 0);
+        uint64_t f_rate = psym(lib, "mc_rate", NULL, 0);
+        uint64_t f_lb = psym(lib, "mc_last", NULL, 0);
+        uint64_t f_av = psym(lib, "mc_avail", NULL, 0);
+        uint64_t f_wf = psym(lib, "mc_wf", NULL, 0);
+        uint64_t f_cr = psym(lib, "mc_caprate", NULL, 0);
         if (f_cap) cap = call2(f_cap, 0, 0);
         if (f_sub) sub = call2(f_sub, 0, 0);
         if (f_uid) uid = call2(f_uid, 0, 0);
-    }
-    {
-        uint64_t f_rate = psym(payload, "mc_rate", NULL, 0);
-        uint64_t f_lb = psym(payload, "mc_last", NULL, 0);
-        uint64_t f_lf = f_lb, f_lfs = f_lb;
-        uint64_t f_av = psym(payload, "mc_avail", NULL, 0);
-        uint64_t f_wf2 = psym(payload, "mc_wf", NULL, 0);
-        uint64_t rate = f_rate ? call2(f_rate, 0, 0) : 0;
-        uint64_t lb = f_lb ? call2(f_lb, 0, 0) : 0;
-        uint64_t lf = f_lf ? call2(f_lf, 1, 0) : 0;
-        uint64_t lfs = f_lfs ? call2(f_lfs, 2, 0) : 0;
-        uint64_t av = f_av ? call2(f_av, 0, 0) : 0;
-        uint64_t wf = f_wf2 ? call2(f_wf2, 0, 0) : 0;
-        uint64_t f_cr = psym(payload, "mc_caprate", NULL, 0);
-        uint64_t cr = f_cr ? call2(f_cr, 0, 0) : 0;
-
+        if (f_rate) rate = call2(f_rate, 0, 0);
+        if (f_lb) { lb = call2(f_lb, 0, 0); lf = call2(f_lb, 1, 0); lfs = call2(f_lb, 2, 0); }
+        if (f_av) av = call2(f_av, 0, 0);
+        if (f_wf) wf = call2(f_wf, 0, 0);
+        if (f_cr) cr = call2(f_cr, 0, 0);
         printf("速率=%llu 缓冲速率=%llu 字节=%llu 帧=%llu 帧字节=%llu 可用=%llu 写=%llu\n",
                (unsigned long long)rate, (unsigned long long)cr, (unsigned long long)lb,
                (unsigned long long)lf, (unsigned long long)lfs,
@@ -432,6 +528,7 @@ static int cmd_status(const char *payload) {
     }
     do_detach();
     if (!on) { printf("未启用\n"); return 0; }
+    if (!lib) { printf("启用中（钩子是旧版装的，重启手机后再查）\n"); return 0; }
     printf("启用中 采集=%llu 注入=%llu 音轨=%llu\n",
            (unsigned long long)cap, (unsigned long long)sub, (unsigned long long)uid);
     return 0;

@@ -4,6 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.MessageDigest
 
 /**
  * 把音乐送进麦克风的那套东西。
@@ -20,14 +21,13 @@ class Injector(private val context: Context) {
     /** 工具与载荷在系统声音进程能读到的位置。该目录只有 root 能进。 */
     private val stageDir = File("/data/misc/audioserver")
 
-    private val stagePayload get() = File(stageDir, "libmcpayload.so")
     private val stageInject get() = File(context.filesDir, "mcinject")
 
     /** 打开：把目标应用的声音接到麦克风入口。 */
     suspend fun enable(targetUid: Int): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            prepare()
-            val out = run("on", stagePayload.absolutePath, targetUid.toString())
+            val payload = prepare()
+            val out = run("on", payload.absolutePath, targetUid.toString())
             require(out.contains("已开启")) { out.ifBlank { "注入失败" } }
             out.trim()
         }
@@ -36,49 +36,74 @@ class Injector(private val context: Context) {
     /** 关闭：停止替换，麦克风恢复原样。 */
     suspend fun disable(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            if (!stagePayload.exists()) return@runCatching "未启用"
-            val out = run("off", stagePayload.absolutePath)
-            out.trim()
+            tool()
+            // 卸载不认载荷路径，只按声音进程里实际映射的那几份来卸
+            run("off", "-").trim()
         }
     }
 
     /** 查询当前状态，用于界面展示。 */
     suspend fun status(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            if (!stagePayload.exists()) return@runCatching "未启用"
-            run("status", stagePayload.absolutePath).trim()
+            tool()
+            run("status", "-").trim()
         }
     }
 
     /**
-     * 把工具和载荷准备到可用的位置。
+     * 把工具和载荷准备到可用的位置，返回系统声音进程该用的载荷路径。
      *
-     * 载荷必须放在系统声音进程读得到、且带可加载标记的目录，还要给它打上
-     * 系统库的标签，否则该进程会拒绝加载。工具本身放在应用私有目录即可，
-     * root 能直接执行。
+     * 载荷按内容命名，形如 `libmcpayload-3f8a1c2d4e5f.so`。内容一变就是另一个文件，
+     * 声音进程里已经映射的那份不会被覆盖，工具按文件名取到的符号才对得上。
      */
-    private fun prepare() {
-        stageDir.mkdirs()
+    private fun prepare(): File {
+        val payloadBytes = context.assets.open("libmcpayload.so").use { it.readBytes() }
+        val tag = MessageDigest.getInstance("SHA-256").digest(payloadBytes)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            .take(12)
+        val name = "libmcpayload-$tag.so"
 
-        val payloadOut = File(context.filesDir, "libmcpayload.so")
-        if (!payloadOut.exists() || payloadOut.length() == 0L) {
-            context.assets.open("libmcpayload.so").use { input ->
-                payloadOut.outputStream().use { input.copyTo(it) }
-            }
-        }
-        if (!stageInject.exists() || stageInject.length() == 0L) {
-            context.assets.open("mcinject").use { input ->
-                stageInject.outputStream().use { input.copyTo(it) }
-            }
+        val payloadOut = File(context.filesDir, name)
+        if (!payloadOut.exists() || payloadOut.length() != payloadBytes.size.toLong()) {
+            payloadOut.writeBytes(payloadBytes)
         }
 
-        // 复制到目标目录并设置权限与标签。这几步都要 root。
+        stageTool()
+
+        // 载荷只在目标位置还没有这份内容时复制，先写临时名再改名，不留半截文件。
+        // 复制这几步都要 root。
+        val payload = File(stageDir, name)
         sh(
-            "cp ${payloadOut.absolutePath} ${stagePayload.absolutePath}",
-            "chmod 755 ${stagePayload.absolutePath}",
-            "chmod 755 ${stageInject.absolutePath}",
-            "chcon u:object_r:system_lib_file:s0 ${stagePayload.absolutePath}",
+            "mkdir -p ${stageDir.absolutePath}",
+            "if [ ! -f ${payload.absolutePath} ]; then " +
+                "cp ${payloadOut.absolutePath} ${payload.absolutePath}.$$ && " +
+                "mv ${payload.absolutePath}.$$ ${payload.absolutePath} || exit 1; fi",
+            "chmod 755 ${payload.absolutePath}",
+            "chcon u:object_r:system_lib_file:s0 ${payload.absolutePath}",
         )
+        return payload
+    }
+
+    /** 关闭和查询用：刷新失败就用已经存在的那份，让「关掉」这个兜底动作还能走。 */
+    private fun tool(): File {
+        runCatching { stageTool() }
+        if (!stageInject.exists()) throw IllegalStateException("工具还没准备好")
+        return stageInject
+    }
+
+    /** 工具每次都用安装包里的这份：文件目录跨版本保留，不刷新就会一直跑旧工具。 */
+    private fun stageTool() {
+        val tmp = File.createTempFile("mcinject", ".new", context.filesDir)
+        try {
+            context.assets.open("mcinject").use { input ->
+                tmp.outputStream().use { input.copyTo(it) }
+            }
+            tmp.setReadable(true, false)
+            tmp.setExecutable(true, false)
+            if (!tmp.renameTo(stageInject)) error("工具写入失败")
+        } finally {
+            tmp.delete()
+        }
     }
 
     private fun run(vararg args: String): String {
@@ -92,7 +117,8 @@ class Injector(private val context: Context) {
             .redirectErrorStream(true)
             .start()
         val out = proc.inputStream.bufferedReader().readText()
-        proc.waitFor()
+        val code = proc.waitFor()
+        if (code != 0) throw IllegalStateException(out.trim().ifBlank { "执行失败：$code" })
         return out
     }
 }
