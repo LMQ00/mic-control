@@ -21,23 +21,28 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -99,12 +104,21 @@ private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val injector = remember { Injector(context) }
+    val focusManager = LocalFocusManager.current
+    val listState = rememberLazyListState()
 
     // 用 remember 让状态在重组之间保持；初值来自存储，保证重开界面时状态不丢
     var enabled by remember { mutableStateOf(store.enabled) }
     var selected by remember { mutableStateOf(store.musicPackage) }
+    // 搜索词用 rememberSaveable，转屏或重建界面后仍然保留
+    var query by rememberSaveable { mutableStateOf("") }
     var message by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
+
+    // 关键词一变，列表回到顶部，避免沿用上一次筛选时的滚动位置
+    LaunchedEffect(query) {
+        listState.scrollToItem(0)
+    }
 
     /** 把当前选择落到系统上。开关关着时只是把钩子撤掉。 */
     fun apply(on: Boolean) {
@@ -213,19 +227,39 @@ private fun ControlScreen(store: SettingsStore, candidates: List<MusicApp>) {
                 style = MaterialTheme.typography.bodyMedium,
             )
         } else {
-            LazyColumn(modifier = Modifier.weight(1f)) {
-                items(candidates, key = { it.packageName }) { app ->
-                    AppRow(
-                        app = app,
-                        checked = app.packageName == selected,
-                        onSelect = {
-                            selected = app.packageName
-                            store.musicPackage = app.packageName
-                            // 换应用时若开关是开着的，立刻按新应用重装
-                            if (enabled) apply(true)
-                        },
-                    )
-                    HorizontalDivider()
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("搜索应用名称或包名") },
+                singleLine = true,
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            val visible = AppScanner.filterApps(candidates, query)
+            if (visible.isEmpty()) {
+                Text(
+                    text = "没有找到匹配的应用。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                LazyColumn(state = listState, modifier = Modifier.weight(1f)) {
+                    items(visible, key = { it.packageName }) { app ->
+                        AppRow(
+                            app = app,
+                            checked = app.packageName == selected,
+                            onSelect = {
+                                focusManager.clearFocus()
+                                selected = app.packageName
+                                store.musicPackage = app.packageName
+                                // 换应用时若开关是开着的，立刻按新应用重装
+                                if (enabled) apply(true)
+                            },
+                        )
+                        HorizontalDivider()
+                    }
                 }
             }
         }

@@ -39,4 +39,18 @@ object AppScanner {
             emptyList()
         }
     }
+
+    /**
+     * 按关键词筛出匹配的应用。
+     *
+     * 关键词为空时返回原列表；否则应用名称或包名包含关键词即算匹配，不区分大小写。
+     */
+    fun filterApps(apps: List<MusicApp>, query: String): List<MusicApp> {
+        val keyword = query.trim()
+        if (keyword.isEmpty()) return apps
+        return apps.filter {
+            it.label.contains(keyword, ignoreCase = true) ||
+                it.packageName.contains(keyword, ignoreCase = true)
+        }
+    }
 }
