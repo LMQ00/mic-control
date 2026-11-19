@@ -129,20 +129,16 @@ __attribute__((visibility("hidden"))) static volatile u64 g_target;
 __attribute__((visibility("hidden"))) static volatile u32 g_on;
 __attribute__((visibility("hidden"))) static u64 g_capc, g_capt, g_injc, g_subs;
 __attribute__((visibility("hidden"))) static u64 g_ch, g_rate;
-__attribute__((visibility("hidden"))) static volatile u32 g_locks, g_lockc;
-static void lkc(void){ u32 v=1,st=1;
-    while(st){
-        __asm__ volatile("ldaxr %w0, [%1]":"=r"(v):"r"(&g_lockc):"memory");
-        if(v) continue;
-        __asm__ volatile("stxr %w0, %w2, [%1]":"=&r"(st):"r"(&g_lockc),"r"(v):"memory");
-    } }
-static void ulc(void){ __asm__ volatile("stlr wzr, [%0]"::"r"(&g_lockc):"memory"); }
-static void lk(void){ u32 v=1,st=1;
-    while(st){
-        __asm__ volatile("ldaxr %w0, [%1]":"=r"(v):"r"(&g_locks):"memory");
-        if(v) continue;
-        __asm__ volatile("stxr %w0, %w2, [%1]":"=&r"(st):"r"(&g_locks),"r"(v):"memory");
-    } }
+__attribute__((visibility("hidden"))) static volatile u32 g_locks;
+static void lk(void){
+    for (;;){
+        u32 v, st;
+        __asm__ volatile("ldaxr %w0, [%1]" : "=r"(v) : "r"(&g_locks) : "memory");
+        if (v){ __asm__ volatile("yield" ::: "memory"); continue; }
+        __asm__ volatile("stxr %w0, %w2, [%1]" : "=&r"(st) : "r"(&g_locks), "r"(1u) : "memory");
+        if (!st) return;
+    }
+}
 static void ul(void){ __asm__ volatile("stlr wzr, [%0]"::"r"(&g_locks):"memory"); }
 /* 采集源：只从一条音轨抄 */
 __attribute__((visibility("hidden"))) static volatile u64 g_src;
@@ -180,34 +176,51 @@ static inline u64 ns_diff(u64 a, u64 b){
 }
 
 /* step：每输出一帧要从环形缓冲吃掉多少帧，16 位小数。
-   pump：累计吃掉的帧数；pump0：上次校准时的值。 */
+   fixed：这条流用指定起点，第一块不套积压钳位。 */
 typedef struct { u64 self; u64 rp; u64 frac; u64 rate; u64 ch; u64 lastt; u64 cnt; i32 last;
-                 u64 step; u64 pump; u64 pump0; u64 avail0; u64 calt; u64 est; } st_t;
+                 u64 step; u64 fixed; } st_t;
 __attribute__((visibility("hidden"))) static st_t g_st[MAX_STREAMS];
 __attribute__((visibility("hidden"))) static u32 g_stn;
 
 /* 新流从“最旧可用数据”开始读。缓冲里最多留 200 毫秒的积压，
    新流取这段的起点，既不会读空，也不会落后太多。 */
-static st_t* st_find(u64 self){
-    for (u32 i = 0; i < g_stn; i++) if (g_st[i].self == self) return &g_st[i];
-    if (g_stn >= MAX_STREAMS) return 0;
-    st_t *p = &g_st[g_stn++];
+static void st_init(st_t *p, u64 self){
     u64 wf = g_wf;
+    u64 start = g_rpstart1;
     p->self = self;
-    p->rp = g_rpstart1 ? g_rpstart1 - 1 : (wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0);
+    p->rp = start ? start - 1 : (wf > MAX_BACKLOG ? wf - MAX_BACKLOG : 0);
+    if (start) g_rpstart1 = 0;      /* 指定起点只给下一条新流用一次 */
     p->frac = 0;
     p->rate = 48000;
-    p->ch = 1;
+    p->ch = 2;
     p->lastt = 0;
     p->cnt = 0;
     p->last = 0;
     p->step = 0;
-    p->pump = 0;
-    p->pump0 = 0;
-    p->avail0 = 0;
-    p->calt = 0;
-    p->est = 0;
-    return p;
+    p->fixed = start ? 1 : 0;
+}
+
+/* 流按对象地址认。地址会被后来的流复用：隔了 5 秒又出现的地址按新流重置。
+   表满了只回收 5 秒没被调用的条目；没有可回收的就放弃这条流，不碰正在用的。 */
+#define STALE_NS 5000000000ULL
+static st_t* st_find(u64 self, u64 now){
+    st_t *r = 0;
+    lk();
+    for (u32 i = 0; i < g_stn; i++) if (g_st[i].self == self){
+        r = &g_st[i];
+        if (r->lastt && ns_diff(now, r->lastt) > STALE_NS) st_init(r, self);
+        break;
+    }
+    if (!r){
+        if (g_stn < MAX_STREAMS) r = &g_st[g_stn++];
+        else for (u32 i = 0; i < g_stn; i++)
+            if (g_st[i].lastt && ns_diff(now, g_st[i].lastt) > STALE_NS &&
+                (!r || g_st[i].lastt < r->lastt)) r = &g_st[i];
+        if (r) st_init(r, self);
+    }
+    if (r) r->lastt = now;
+    ul();
+    return r;
 }
 
 static void flushc(u64 a, u64 n){
@@ -223,12 +236,12 @@ static void memw(u64 a, const void *d, u64 n){
     if (g_mem >= 0) sy(SYS_pwrite64, g_mem, (i64)d, (i64)n, (i64)a, 0, 0);
     flushc(a, n);
 }
-static inline s16 f2s(float x){
-    if (x >  1.0f) x =  1.0f;
-    if (x < -1.0f) x = -1.0f;
-    return (s16)(x * 32767.0f);
+/* 数声道掩码里有几位，得到声道数。 */
+static inline u32 popc(u32 x){
+    u32 c = 0;
+    while (x){ x &= x - 1; c++; }
+    return c;
 }
-
 /* 采集：目标应用的播放复制进环形缓冲。 */
 __attribute__((used, noinline))
 i64 mc_cap_c(void *self, void *buf){
@@ -305,116 +318,107 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     g_injc++;
     if (r != 0 || !self || !buf || !bytes || !g_on) return r;
 
-    st_t *sp = st_find((u64)self);
-    if (!sp) return r;
-
-    /* 采样率和声道数按流各自记住。系统里同时有 16000 和 48000 的流，
-       共用一个全局值会让后调用的流把前者的参数覆盖掉。 */
-    u64 ch = *(u32 *)((u8 *)self + 0x4c);
-    if (ch < 1 || ch > 8) ch = sp->ch;
-    sp->ch = ch;
-    g_ch = ch;
-
-    u64 fsz = 2 * ch;
-    u64 frames = bytes / fsz;
-    if (!frames) return r;
+    /* 原函数写回的实际字节数；拿不到时按请求长度算。 */
+    u64 got = bytes;
+    if (outN && *outN < bytes) got = *outN;
 
     u64 t = now_ns();
+    st_t *sp = st_find((u64)self, t);
+    if (!sp) return r;
+
+    /* 流对象里存着这条流的配置：0x44 采样率、0x48 声道掩码。
+       声道数按掩码位数算，采样率直接用配置值。 */
+    u32 cfgr = *(u32 *)((u8 *)self + 0x44);
+    u32 cfgn = *(u32 *)((u8 *)self + 0x48);
+    u64 ch = popc(cfgn);
+    if (ch < 1 || ch > 8) ch = 2;
+    sp->ch = ch;
+    g_ch = ch;
+    if (cfgr >= 8000 && cfgr <= 192000) sp->rate = cfgr;
+
+    u64 fsz = 2 * ch;
+    u64 frames = got / fsz;
     sp->lastt = t;
     sp->cnt++;
-    u64 rate = sp->rate;
-    g_rate = rate;
+    if (!frames) return r;
 
     s16 *o = (s16 *)buf;
     u64 wf = g_wf;
-    g_lastbytes = bytes; g_lastframes = frames; g_lastfsz = fsz;
+    g_lastbytes = got; g_lastframes = frames; g_lastfsz = fsz;
+
+    /* 不属于整帧的尾巴清零，不留原始麦克风数据 */
+    for (u64 k = frames * ch; k < bytes / 2; k++) o[k] = 0;
 
     /* 还没抄到音乐：输出静音 */
     if (wf < 2){
-        for (u64 i = 0; i < bytes / 2; i++) o[i] = 0;
-        if (outN) *outN = bytes;
+        for (u64 k = 0; k < frames * ch; k++) o[k] = 0;
+        if (outN) *outN = frames * fsz;
         g_subs++;
         return r;
     }
 
-    if (!g_rpstart1 && wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
+    /* 缓冲里已有的数据超过允许的积压：退到积压上限。
+       读位置越过写位置（旧流复用对象留下的）就贴住写位置。 */
+    if (sp->fixed){
+        /* 指定起点一直有效，直到积压回到上限以内 */
+        if (wf <= sp->rp || wf - sp->rp <= MAX_BACKLOG) sp->fixed = 0;
+    } else if (wf > sp->rp && wf - sp->rp > MAX_BACKLOG)
         sp->rp = wf - MAX_BACKLOG;
+    else if (sp->rp > wf)
+        sp->rp = wf;
 
-    /* 步长直接量：看环形缓冲的积压怎么变。
-       积压涨了说明吃得太慢，步长要加大；跌了说明吃得太快。
-       量出来的步长不依赖任何采样率字段，也不会被采样率估算的误差带偏。 */
-    /* 步长按“这条流每秒要吃多少帧”定。
-       采集每抄一帧前进一帧，所以环形缓冲里 1 秒正好是 g_caprate 帧。
-       这条流 1 秒交付多少帧，用累计交付帧数除以时间直接算，
-       不读采样率字段，也不受采样率猜错的影响。 */
-    /* 步长 = 环形缓冲速率 ÷ 这条流每秒交付的帧数，再乘 HAL 的换算系数。
-       HAL 自称的采样率和它实际消耗的速率差一个固定比例，
-       这个比例在 device 上量出来是 1.0897（48000/44100 的倒数）。 */
+    /* 步长 = 环形缓冲的写入速率 ÷ 这条流的采样率。
+       缓冲写入速率随歌曲采样率变化，每次重算。 */
     {
-        if (!sp->step){
-            u64 sr = rate;
-            sp->step = sr ? (g_caprate << 16) / sr : 0x10000;
-            sp->calt = t; sp->pump0 = sp->pump;
-        } else if (ns_diff(t, sp->calt) >= 2000000000ULL){
-            u64 dp = sp->pump - sp->pump0;
-            u64 dt = ns_diff(t, sp->calt);
-            if (dp > 8192 && dt){
-                u64 sr = dp * 1000000000ULL / dt;
-                if (sr >= 8000 && sr <= 192000){
-                    /* 两次相隔不到 1% 才采纳，单次抖动不带进来 */
-                    if (sp->est && sr + sr/100 > sp->est && sr - sr/100 < sp->est){
-                        sp->rate = sr;
-                        sp->step = (g_caprate << 16) / sr;
-                    }
-                    sp->est = sr;
-                }
-            }
-            sp->pump0 = sp->pump; sp->calt = t;
-        }
+        u64 sr = sp->rate;
+        sp->step = sr ? (g_caprate << 16) / sr : 0x10000;
     }
 
+    u64 rate = sp->rate;
+    g_rate = rate;
     u64 rp = sp->rp;
     u64 step = sp->step;
     u64 pos = sp->frac;
     i32 last = sp->last;
 
-    for (u64 i = 0; i < frames; i++){
+    u64 i = 0;
+    for (; i < frames; i++){
         u64 src = pos >> 16;
         u64 fr = pos & 0xFFFF;
+        i32 L, R;
         if (rp + src + 1 < wf){
             u64 p0 = (rp + src) % RING_FRAMES, p1 = (rp + src + 1) % RING_FRAMES;
             /* 相邻两点线性插值。直接取整会让波形出锯齿，听着发毛。 */
             i32 l0 = g_ring[p0*2], l1 = g_ring[p1*2];
             i32 r0 = g_ring[p0*2+1], r1 = g_ring[p1*2+1];
-            i32 L = l0 + (i32)(((i64)(l1 - l0) * (i64)fr) >> 16);
-            i32 R = r0 + (i32)(((i64)(r1 - r0) * (i64)fr) >> 16);
-            last = (ch == 1) ? (L + R) / 2 : L;
-            if (ch == 1) o[i] = (s16)last;
-            else {
-                o[i*ch] = (s16)L;
-                o[i*ch+1] = (s16)R;
-                for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)L;
-            }
+            L = l0 + (i32)(((i64)(l1 - l0) * (i64)fr) >> 16);
+            R = r0 + (i32)(((i64)(r1 - r0) * (i64)fr) >> 16);
         } else if (rp + src < wf){
             u64 p = (rp + src) % RING_FRAMES;
-            i32 L = g_ring[p*2], R = g_ring[p*2+1];
-            last = (ch == 1) ? (L + R) / 2 : L;
-            if (ch == 1) o[i] = (s16)last;
-            else {
-                o[i*ch] = (s16)L;
-                o[i*ch+1] = (s16)R;
-                for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)L;
-            }
+            L = g_ring[p*2]; R = g_ring[p*2+1];
         } else {
-            if (ch == 1) o[i] = (s16)last;
-            else for (u64 c = 0; c < ch; c++) o[i*ch+c] = (s16)last;
+            break;
+        }
+        last = (ch == 1) ? (L + R) / 2 : L;
+        if (ch == 1) o[i] = (s16)last;
+        else {
+            o[i*ch] = (s16)L;
+            o[i*ch+1] = (s16)R;
+            for (u64 c = 2; c < ch; c++) o[i*ch+c] = (s16)((c & 1) ? R : L);
         }
         pos += step;
+    }
+
+    /* 缓冲里没数据了：这一段输出静音，读位置停在已有数据的末尾。
+       数据再写进来时从这里接着播，读位置不会被这段静音甩到前面去。 */
+    for (; i < frames; i++){
+        if (ch == 1) o[i] = 0;
+        else for (u64 c = 0; c < ch; c++) o[i*ch+c] = 0;
     }
     sp->frac = pos & 0xFFFF;
     sp->last = last;
     sp->rp = rp + (pos >> 16);
-    sp->pump += frames;
+    if (sp->rp > wf) sp->rp = wf;
     if (outN) *outN = frames * fsz;
     g_subs++;
     return r;
@@ -467,7 +471,7 @@ u64 mc_st(u64 i, u64 f){
         case 3: return p->rate;
         case 4: return p->ch;
         case 5: return (u64)sizeof(st_t);
-        case 6: return p->est;
+        case 6: return p->lastt;
         case 7: return (u64)p->frac;
         default: return 0;
     }
@@ -499,7 +503,10 @@ void mc_setstart(u64 f){ g_rpstart1 = f + 1; }
 void mc_on(void){
     __asm__ volatile("dmb ish":::"memory");
     u64 wf = g_wf;
-    for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; }
+    u64 t = now_ns();
+    lk();
+    for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; g_st[i].lastt = t; }
+    ul();
     g_src = 0;
     g_srctick = 0;
     g_on = 1;
@@ -508,7 +515,9 @@ void mc_off(void){ g_on = 0; }
 void mc_reset(void){
     __asm__ volatile("dmb ish":::"memory");
     u64 wf = g_wf;
+    lk();
     for (u32 i = 0; i < g_stn; i++){ g_st[i].rp = wf; g_st[i].frac = 0; }
+    ul();
     g_src = 0; g_srctick = 0;
     g_capc = g_capt = g_injc = g_subs = 0;
     g_capf0 = 0; g_capt0 = 0; g_capcand = 0; g_capvote = 0;
@@ -538,7 +547,7 @@ int mc_fillsine(u64 freq, u64 frames){
         g_ring[i*2] = v; g_ring[i*2+1] = v;
     }
     __asm__ volatile("dmb ish":::"memory");
-    g_wf = frames; g_stn = 0; g_rpstart1 = 1;
+    lk(); g_wf = frames; g_stn = 0; g_rpstart1 = 1; ul();
     return 0;
 }
 
@@ -546,19 +555,8 @@ int mc_fillpat(u64 v, u64 frames){
     if (frames > RING_FRAMES) frames = RING_FRAMES;
     for (u64 i = 0; i < frames; i++){ g_ring[i*2] = (s16)v; g_ring[i*2+1] = (s16)v; }
     __asm__ volatile("dmb ish":::"memory");
-    g_wf = frames; g_stn = 0;
+    lk(); g_wf = frames; g_stn = 0; ul();
     return 0;
-}
-
-/* 入口跳转：bti jc + ldr x16,#8 + br x16 + 处理器地址 */
-static void mkentry(u64 entry, u64 handler){
-    u8 b[16];
-    u32 jc = 0xd50324dfU, ldr = 0x58000050u, br = 0xd61f0200u;
-    for (int k = 0; k < 4; k++) b[k] = (u8)(jc >> (8*k));
-    for (int k = 0; k < 4; k++) b[4+k] = (u8)(ldr >> (8*k));
-    for (int k = 0; k < 4; k++) b[8+k] = (u8)(br >> (8*k));
-    for (int k = 0; k < 8; k++) b[12+k] = (u8)(handler >> (8*k));
-    memw(entry, b, 16);
 }
 
 /* 影子入口：原函数开头 n 条指令（含落地点那条），再 br 回原函数第 n+1 条。
