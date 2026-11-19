@@ -36,7 +36,7 @@ class Injector(private val context: Context) {
     /** 关闭：停止替换，麦克风恢复原样。 */
     suspend fun disable(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            stageTool()
+            tool()
             // 卸载不认载荷路径，只按声音进程里实际映射的那几份来卸
             run("off", "-").trim()
         }
@@ -45,7 +45,7 @@ class Injector(private val context: Context) {
     /** 查询当前状态，用于界面展示。 */
     suspend fun status(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            stageTool()
+            tool()
             run("status", "-").trim()
         }
     }
@@ -79,10 +79,16 @@ class Injector(private val context: Context) {
                 "cp ${payloadOut.absolutePath} ${payload.absolutePath}.$$ && " +
                 "mv ${payload.absolutePath}.$$ ${payload.absolutePath} || exit 1; fi",
             "chmod 755 ${payload.absolutePath}",
-            "chmod 755 ${stageInject.absolutePath}",
             "chcon u:object_r:system_lib_file:s0 ${payload.absolutePath}",
         )
         return payload
+    }
+
+    /** 关闭和查询用：刷新失败就用已经存在的那份，让「关掉」这个兜底动作还能走。 */
+    private fun tool(): File {
+        runCatching { stageTool() }
+        if (!stageInject.exists()) throw IllegalStateException("工具还没准备好")
+        return stageInject
     }
 
     /** 工具每次都用安装包里的这份：文件目录跨版本保留，不刷新就会一直跑旧工具。 */
@@ -92,7 +98,8 @@ class Injector(private val context: Context) {
             context.assets.open("mcinject").use { input ->
                 tmp.outputStream().use { input.copyTo(it) }
             }
-            tmp.setExecutable(true)
+            tmp.setReadable(true, false)
+            tmp.setExecutable(true, false)
             if (!tmp.renameTo(stageInject)) error("工具写入失败")
         } finally {
             tmp.delete()

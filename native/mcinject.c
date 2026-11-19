@@ -113,6 +113,8 @@ static uint64_t esym(const char *path, const char *name) {
             char *st = (char *)m + stsh->sh_offset;
             for (size_t j = 0; j < sh[i].sh_size / sizeof(Elf64_Sym); j++) {
                 if (!sy[j].st_name || sy[j].st_name >= stsh->sh_size) continue;
+                size_t lim = stsh->sh_size - sy[j].st_name;
+                if (strnlen(st + sy[j].st_name, lim) >= lim) continue;
                 if (sy[j].st_shndx == SHN_UNDEF) continue;
                 if (!strcmp(st + sy[j].st_name, name)) { out = sy[j].st_value; break; }
             }
@@ -308,7 +310,7 @@ static int loads_scan(load_t *out, int max) {
     char mp[64];
     snprintf(mp, sizeof mp, "/proc/%d/maps", g_pid);
     FILE *f = fopen(mp, "r");
-    if (!f) return 0;
+    if (!f) return -1;
     int n = loads_parse(f, out, max);
     fclose(f);
     return n;
@@ -332,6 +334,7 @@ static int payload_path(const char *path) {
 static int uninstall_loaded(const char *keep) {
     load_t ls[MAX_LOADS];
     int n = loads_scan(ls, MAX_LOADS);
+    if (n < 0) { fprintf(stderr, "读不到声音进程的内存映射\n"); return 1; }
     const char *old = 0, *lost = 0;
     for (int i = 0; i < n; i++) {
         if (keep && !strcmp(ls[i].path, keep)) continue;
@@ -415,7 +418,9 @@ static int cmd_off(const char *payload) {
     g_pid = find_proc(NULL);
     if (g_pid <= 0) { printf("系统声音进程没在跑，无需操作\n"); return 0; }
     load_t ls[MAX_LOADS];
-    if (!loads_scan(ls, MAX_LOADS)) { printf("没有装过\n"); return 0; }
+    int n = loads_scan(ls, MAX_LOADS);
+    if (n < 0) { fprintf(stderr, "读不到声音进程的内存映射\n"); return 1; }
+    if (!n) { printf("没有装过\n"); return 0; }
     if (do_attach()) { do_detach(); return 1; }
     int rc = uninstall_loaded(NULL);
     do_detach();
