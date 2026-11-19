@@ -44,7 +44,7 @@ P=$(su -c 'ls -t /data/misc/audioserver/libmcpayload-*.so | head -1')
 su -c "/data/data/com.lmq.miccontrol/files/mcinject status $P"
 ```
 
-第一行取的是工具这次用的那份载荷。载荷按内容命名，界面上开关拨过一次后这个名字才会出现。
+第一行取的是最新落盘的那份载荷。载荷按内容命名，界面上开关拨过一次后这个名字才会出现。升级后目录里还会留着旧版的 `libmcpayload.so`，拨过开关后以最新落盘的那份为准。
 
 **看到什么算成功**：输出形如「启用中 采集=… 注入=… 音轨=…」。
 

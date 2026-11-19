@@ -36,16 +36,17 @@ class Injector(private val context: Context) {
     /** 关闭：停止替换，麦克风恢复原样。 */
     suspend fun disable(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            val payload = prepare()
-            run("off", payload.absolutePath).trim()
+            stageTool()
+            // 卸载不认载荷路径，只按声音进程里实际映射的那几份来卸
+            run("off", "-").trim()
         }
     }
 
     /** 查询当前状态，用于界面展示。 */
     suspend fun status(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            val payload = prepare()
-            run("status", payload.absolutePath).trim()
+            stageTool()
+            run("status", "-").trim()
         }
     }
 
@@ -67,24 +68,35 @@ class Injector(private val context: Context) {
             payloadOut.writeBytes(payloadBytes)
         }
 
-        // 工具每次都用安装包里的这份：文件目录跨版本保留，不刷新就会一直跑旧工具
-        val injectNew = File(context.filesDir, "mcinject.new")
-        context.assets.open("mcinject").use { input ->
-            injectNew.outputStream().use { input.copyTo(it) }
-        }
-        injectNew.setExecutable(true)
-        if (!injectNew.renameTo(stageInject)) error("工具写入失败")
+        stageTool()
 
-        // 载荷只在目标位置还没有这份内容时复制。复制这几步都要 root。
+        // 载荷只在目标位置还没有这份内容时复制，先写临时名再改名，不留半截文件。
+        // 复制这几步都要 root。
         val payload = File(stageDir, name)
         sh(
             "mkdir -p ${stageDir.absolutePath}",
-            "if [ ! -f ${payload.absolutePath} ]; then cp ${payloadOut.absolutePath} ${payload.absolutePath}; fi",
+            "if [ ! -f ${payload.absolutePath} ]; then " +
+                "cp ${payloadOut.absolutePath} ${payload.absolutePath}.$$ && " +
+                "mv ${payload.absolutePath}.$$ ${payload.absolutePath} || exit 1; fi",
             "chmod 755 ${payload.absolutePath}",
             "chmod 755 ${stageInject.absolutePath}",
             "chcon u:object_r:system_lib_file:s0 ${payload.absolutePath}",
         )
         return payload
+    }
+
+    /** 工具每次都用安装包里的这份：文件目录跨版本保留，不刷新就会一直跑旧工具。 */
+    private fun stageTool() {
+        val tmp = File.createTempFile("mcinject", ".new", context.filesDir)
+        try {
+            context.assets.open("mcinject").use { input ->
+                tmp.outputStream().use { input.copyTo(it) }
+            }
+            tmp.setExecutable(true)
+            if (!tmp.renameTo(stageInject)) error("工具写入失败")
+        } finally {
+            tmp.delete()
+        }
     }
 
     private fun run(vararg args: String): String {
@@ -98,7 +110,8 @@ class Injector(private val context: Context) {
             .redirectErrorStream(true)
             .start()
         val out = proc.inputStream.bufferedReader().readText()
-        proc.waitFor()
+        val code = proc.waitFor()
+        if (code != 0) throw IllegalStateException(out.trim().ifBlank { "执行失败：$code" })
         return out
     }
 }
