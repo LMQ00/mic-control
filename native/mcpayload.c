@@ -242,6 +242,67 @@ static inline u32 popc(u32 x){
     while (x){ x &= x - 1; c++; }
     return c;
 }
+/* 标准的采样率。字段读出的值不在这张表里，就不采信这个字段。 */
+static const u64 g_stdrate[] = {4000,8000,11025,12000,16000,22050,24000,32000,
+                                44100,48000,64000,88200,96000,176400,192000,384000};
+static inline u32 is_std_rate(u64 r){
+    for (u32 k = 0; k < sizeof(g_stdrate)/sizeof(g_stdrate[0]); k++)
+        if (g_stdrate[k] == r) return 1;
+    return 0;
+}
+static inline float u2f(const u8 *q){
+    union { u32 u; float f; } cv;
+    cv.u = (u32)q[0] | ((u32)q[1] << 8) | ((u32)q[2] << 16) | ((u32)q[3] << 24);
+    return cv.f;
+}
+/* 前 nf 帧按浮点读的粗糙度（相邻样本差与幅度之比，放大一千倍）。
+   不是正常浮点（NaN、超幅、全零）时返回 0。 */
+#define FLSAMP 32
+static inline u64 rough_float(const u8 *p, u64 ch, u64 nf){
+    float acc = 0.0f, mag = 0.0f, prev = 0.0f;
+    for (u64 i = 0; i < nf; i++){
+        float f = u2f(p + i*ch*4);
+        if (f != f || f > 4.0f || f < -4.0f) return 0;
+        float d = f - prev;
+        if (d < 0.0f) d = -d;
+        acc += d;
+        mag += (f < 0.0f) ? -f : f;
+        prev = f;
+    }
+    if (!(mag > 0.0f)) return 0;
+    return (u64)(acc * 1000.0f / mag);
+}
+/* 同样一段按 16 位整数读的粗糙度。全零时返回全 1。 */
+static inline u64 rough_s16(const u8 *p, u64 ch, u64 nf){
+    i64 acc = 0, mag = 0; i32 prev = 0;
+    for (u64 i = 0; i < nf; i++){
+        const u8 *q = p + i*ch*2;
+        i32 v = (i32)(s16)(u16)((u16)q[0] | ((u16)q[1] << 8));
+        i32 d = v - prev;
+        acc += d < 0 ? -d : d;
+        mag += v < 0 ? -v : v;
+        prev = v;
+    }
+    if (!mag) return ~0ULL;
+    return (u64)(acc * 1000 / mag);
+}
+/* 只认两种编码：1 是 16 位整数，5 是 32 位浮点。fsz 是每帧字节数。 */
+static inline u64 fsz_of(u32 fmt, u64 ch){
+    return (fmt == 5 ? 4 : 2) * ch;
+}
+/* 取第 c 个声道的样本，换算成 16 位整数。 */
+static inline i32 csmp(const u8 *p, u32 fmt, u64 c){
+    if (fmt == 5){
+        float f = u2f(p + c*4);
+        if (f != f) return 0;
+        if (f > 1.0f) f = 1.0f; else if (f < -1.0f) f = -1.0f;
+        return (i32)(f * 32767.0f);
+    }
+    const u8 *q = p + c*2;
+    return (i32)(s16)(u16)((u16)q[0] | ((u16)q[1] << 8));
+}
+/* 浮点判别要读的帧数。块短于 128 帧时不做判别，整块不抄。 */
+#define FLMINFRAMES 128
 /* 采集：目标应用的播放复制进环形缓冲。 */
 __attribute__((used, noinline))
 i64 mc_cap_c(void *self, void *buf){
@@ -261,18 +322,48 @@ i64 mc_cap_c(void *self, void *buf){
         g_srctick = g_wf;
     }
 
-    /* 这个缓冲里是 16 位整数立体声，原样搬即可 */
-    s16 *pcm = *(s16 **)buf;
+    /* 音轨对象里存着这条音轨的配置：0x178 采样率、0x17c 编码、
+       0x180 声道掩码、0x184 声道数。四项对得上才采信，
+       否则按 16 位整数立体声处理。 */
+    u8 *pcm = *(u8 **)buf;
     u64 fc = *(u64 *)((u8 *)buf + 8);
     g_capraw = (u64)pcm;
     g_capfc = fc;
     if (!pcm || !fc) return r;
 
+    u32 cfgr = *(u32 *)((u8 *)self + 0x178);
+    u32 fmt = *(u32 *)((u8 *)self + 0x17c);
+    u32 cfgn = *(u32 *)((u8 *)self + 0x180);
+    u32 cfgc = *(u32 *)((u8 *)self + 0x184);
+    u64 ch = popc(cfgn);
+    if (ch < 1 || ch > 8 || cfgc != ch || !is_std_rate(cfgr) ||
+        (fmt != 1 && fmt != 5)){
+        ch = 2;
+        fmt = 1;
+    }
+
+    /* 浮点要两件事都成立才采信：块够长，且按浮点读明显比按 16 位读平滑。
+       块短于 128 帧时判别要读的字节数可能超出这块内存，直接不判。 */
+    if (fmt == 5){
+        if (fc < FLMINFRAMES) return r;
+        u64 rf = rough_float(pcm, ch, FLSAMP);
+        u64 rs = rough_s16(pcm, ch, FLSAMP);
+        if (!rf || rs <= rf * 2) fmt = 1;
+    }
+
+    g_ch = ch;
+    if (is_std_rate(cfgr)) g_rate = cfgr;
+    if (fc > RING_FRAMES) fc = RING_FRAMES;
+
+    u64 fsz = fsz_of(fmt, ch);
     u64 w = g_wf;
     for (u64 i = 0; i < fc; i++){
-        u64 p = (w + i) % RING_FRAMES;
-        g_ring[p*2]   = pcm[i*2];
-        g_ring[p*2+1] = pcm[i*2+1];
+        const u8 *p = pcm + i*fsz;
+        i32 l = csmp(p, fmt, 0);
+        i32 rr = ch > 1 ? csmp(p, fmt, 1) : l;
+        u64 q = (w + i) % RING_FRAMES;
+        g_ring[q*2]   = (s16)l;
+        g_ring[q*2+1] = (s16)rr;
     }
     __asm__ volatile("dmb ish":::"memory");
     g_wf = w + fc;
@@ -334,7 +425,7 @@ i64 mc_inj_c(void *self, void *buf, u64 bytes, u64 *outN){
     if (ch < 1 || ch > 8) ch = 2;
     sp->ch = ch;
     g_ch = ch;
-    if (cfgr >= 8000 && cfgr <= 192000) sp->rate = cfgr;
+    if (is_std_rate(cfgr)) sp->rate = cfgr;
 
     u64 fsz = 2 * ch;
     u64 frames = got / fsz;
