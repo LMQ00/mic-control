@@ -321,6 +321,12 @@ static int plain_name(const char *path) {
     return !strcmp(bn ? bn + 1 : path, "libmcpayload.so");
 }
 
+/* 参数是不是一份载荷路径。命令里可以传占位符，这时按实际映射的那份取数。 */
+static int payload_path(const char *path) {
+    const char *bn = strrchr(path, '/');
+    return !strncmp(bn ? bn + 1 : path, "libmcpayload", 12);
+}
+
 /* 卸掉声音进程里装着的其他载荷。keep 是本次要用的那份，由调用者先卸。
    载荷文件名带内容标记，映射的文件不会被覆盖，符号按各自的文件解析。 */
 static int uninstall_loaded(const char *keep) {
@@ -486,7 +492,7 @@ static int cmd_status(const char *payload) {
     int on = hooks_present();
     /* 只按带内容标记的那份取数：旧版固定名的文件已被覆盖，符号对不上内存里的代码 */
     const char *lib = 0;
-    if (already_loaded(payload) && !plain_name(payload)) lib = payload;
+    if (payload_path(payload) && already_loaded(payload) && !plain_name(payload)) lib = payload;
     load_t ls[MAX_LOADS];
     int n = loads_scan(ls, MAX_LOADS);
     for (int i = 0; !lib && i < n; i++) if (!plain_name(ls[i].path)) lib = ls[i].path;
